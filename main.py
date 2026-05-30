@@ -207,19 +207,29 @@ def handle_image(event):
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
     goal_label = GOAL_LABEL.get(user["goal"], "no specific goal")
 
+    # Single call: extract dish name + coaching response together
     resp = claude.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=200,
+        max_tokens=250,
         system=SYSTEM_PROMPT.format(goal=goal_label),
         messages=[{"role": "user", "content": [
             {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64}},
-            {"type": "text", "text": "Here's what I'm eating."},
+            {"type": "text", "text": "What dish is this? Start your reply with 'DISH: [dish name]' on the first line, then a blank line, then your coaching response."},
         ]}],
     )
 
-    reply_text = resp.content[0].text
-    _reply(event.reply_token, reply_text)
-    log_meal(user_id, reply_text)
+    full_response = resp.content[0].text
+    lines = full_response.strip().splitlines()
+
+    # Extract dish name for DB, coaching text for user
+    dish_name = "unknown dish"
+    coaching_text = full_response
+    if lines and lines[0].upper().startswith("DISH:"):
+        dish_name = lines[0][5:].strip()
+        coaching_text = "\n".join(lines[2:]).strip() if len(lines) > 2 else full_response
+
+    _reply(event.reply_token, coaching_text)
+    log_meal(user_id, dish_name)  # Store only clean dish name, not full AI response
 
 
 # ── DAILY SUMMARY ─────────────────────────────────────────────────────────────
@@ -238,20 +248,35 @@ def send_daily_summaries():
                 _push(line_user_id, msg)
                 continue
 
-            meal_list = ", ".join(m["description"][:40] for m in meals)
-            has_dinner = any(m["meal_type"] == "dinner" for m in meals)
-            goal_label = GOAL_LABEL.get(user["goal"], "no specific goal")
-
-            prompt = (
-                f"User goal: {goal_label}. Today they ate: {meal_list}. "
-                f"{'They have not logged dinner yet.' if not has_dinner else ''} "
-                f"Write a warm 2-sentence day summary + 1 tip for tomorrow. "
-                f"{'Add a kind dinner wish.' if not has_dinner else ''} "
-                f"Reply in {'Thai' if lang == 'th' else 'English'}. Max 3 sentences, 1 emoji max."
+            # Build structured meal summary by type
+            by_type = {}
+            for m in meals:
+                by_type.setdefault(m["meal_type"], []).append(m["description"])
+            meal_lines = "\n".join(
+                f"- {mtype.capitalize()}: {', '.join(dishes)}"
+                for mtype, dishes in by_type.items()
             )
+            has_dinner = "dinner" in by_type
+            goal_label = GOAL_LABEL.get(user["goal"], "no specific goal")
+            lang_word = "Thai" if lang == "th" else "English"
+
+            prompt = f"""Daily summary for a NutriBuddy user.
+Goal: {goal_label}
+Meals logged today:
+{meal_lines}
+{"⚠️ No dinner logged yet." if not has_dinner else ""}
+
+Write a structured summary following this exact template:
+1. What you ate today — one warm sentence listing the meals (use the dish names above)
+2. Goal progress — one sentence connecting today's eating to their goal
+{"3. Dinner wish — one kind, brief sentence wishing them a healthy dinner" if not has_dinner else ""}
+{"3" if not has_dinner else "3"}. Tomorrow tip — one specific, practical suggestion for tomorrow
+
+Rules: reply in {lang_word}. Max 4 short sentences total. Max 1 emoji. No bullet points in the reply. Warm friend tone."""
+
             resp = claude.messages.create(
                 model="claude-sonnet-4-6",
-                max_tokens=200,
+                max_tokens=250,
                 messages=[{"role": "user", "content": prompt}],
             )
             _push(line_user_id, resp.content[0].text)
@@ -274,7 +299,10 @@ def health():
 
 
 @app.post("/cron/daily-summary")
-def trigger_summary():
-    """Manual trigger for testing."""
+def trigger_summary(request: Request):
+    """Manual trigger — protected by CRON_SECRET header."""
+    expected = os.environ.get("CRON_SECRET", "")
+    if not expected or request.headers.get("X-Cron-Secret", "") != expected:
+        raise HTTPException(status_code=403, detail="Forbidden")
     send_daily_summaries()
     return {"status": "sent"}
