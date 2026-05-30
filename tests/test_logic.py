@@ -18,10 +18,11 @@ def is_thai(text: str) -> bool:
 
 def detect_goal(text: str) -> str | None:
     GOAL_MAP = {
-        "1": "lose_weight", "ลดน้ำหนัก": "lose_weight", "lose weight": "lose_weight",
-        "2": "eat_clean",   "กินสะอาด": "eat_clean",   "eat clean": "eat_clean",
-        "3": "build_muscle","เพิ่มกล้าม": "build_muscle","build muscle": "build_muscle",
-        "4": "no_goal",     "ยังไม่มี": "no_goal",     "no goal": "no_goal",
+        "1": "lose_weight",    "ลดน้ำหนัก": "lose_weight",      "lose weight": "lose_weight",
+        "2": "eat_clean",      "กินสะอาด": "eat_clean",          "eat clean": "eat_clean",
+                               "กินอาหารคลีน": "eat_clean",      "อาหารคลีน": "eat_clean",
+        "3": "build_muscle",   "เพิ่มกล้าม": "build_muscle",     "build muscle": "build_muscle",
+        "4": "no_goal",        "ยังไม่มี": "no_goal",            "no goal": "no_goal",
     }
     t = text.lower().strip()
     for key, goal in GOAL_MAP.items():
@@ -204,6 +205,8 @@ def test_goal_detection():
     run("Off-topic → None", detect_goal("what is the weather?") is None)
     run("Empty → None", detect_goal("") is None)
     run("English goal change", detect_goal("change to eat clean") == "eat_clean")
+    run("New wording กินอาหารคลีน → eat_clean", detect_goal("กินอาหารคลีนมากขึ้น") == "eat_clean")
+    run("New wording อาหารคลีน → eat_clean", detect_goal("อยากกินอาหารคลีน") == "eat_clean")
 
 
 def test_dish_extraction():

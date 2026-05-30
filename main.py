@@ -1,5 +1,6 @@
 import os
 import base64
+import time
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request, HTTPException
 from linebot.v3 import WebhookHandler
@@ -31,17 +32,24 @@ BKK = pytz.timezone("Asia/Bangkok")
 
 # ── COPY ──────────────────────────────────────────────────────────────────────
 
-ONBOARDING_MSG = """สวัสดี! 👋 ฉันคือ NutriBuddy เพื่อนด้านสุขภาพของคุณบน LINE
-
-ส่งรูปอาหารมาให้ฉันดูได้เลย แล้วฉันจะบอกว่าโภชนาการเป็นยังไง พร้อมคำแนะนำเล็กๆ น้อยๆ สำหรับมื้อต่อไป 🍽️
-
-(You can also chat with me in English anytime!)
+ONBOARDING_MSG_1 = """สวัสดี! ฉันคือ NutriBuddy เพื่อนด้านสุขภาพของคุณบน LINE 🥑
 
 ก่อนเริ่ม — เป้าหมายของคุณคืออะไร?
 1️⃣ ลดน้ำหนัก
-2️⃣ กินสะอาดขึ้น
+2️⃣ กินอาหารคลีนมากขึ้น
 3️⃣ เพิ่มกล้ามเนื้อ
-4️⃣ ยังไม่มีเป้าหมาย ขอแค่รู้ว่ากินอะไรอยู่"""
+4️⃣ ยังไม่มีเป้าหมาย ขอแค่รู้ว่ากินอะไรอยู่
+
+(You can also chat with me in English anytime!)"""
+
+ONBOARDING_MSG_2 = """นี่คือสิ่งที่ NutriBuddy ทำได้
+
+ส่งรูปอาหาร — ฉันจะบอกว่าโภชนาการเป็นยังไงและมีคำแนะนำสำหรับมื้อต่อไป
+บอกชื่อเมนู — พิมพ์ก็ได้ ไม่ต้องมีรูปเสมอไป
+ถามประวัติ — "เมื่อเช้ากินอะไร" หรือ "เมื่อวานกินอะไรบ้าง"
+เปลี่ยนเป้าหมาย — บอกได้เลยตลอดเวลา
+สรุปรายวัน — ทุกคืน 20.00 น. ฉันจะส่งสรุปมื้ออาหารวันนี้ให้
+สรุปรายสัปดาห์ — ทุกวันจันทร์ 8.00 น. ฉันจะส่งภาพรวมของสัปดาห์ที่ผ่านมา"""
 
 BLOCKED_TH = "NutriBuddy พักอยู่ 6 ชั่วโมงนะ กลับมาคุยเรื่องอาหารด้วยกันทีหลังได้เลย 🌿"
 BLOCKED_EN = "NutriBuddy is resting for 6 hours. Come back and let's talk food! 🌿"
@@ -79,10 +87,11 @@ CONVERSATIONAL_WHITELIST = {
 }
 
 GOAL_MAP = {
-    "1": "lose_weight", "ลดน้ำหนัก": "lose_weight", "lose weight": "lose_weight",
-    "2": "eat_clean",   "กินสะอาด": "eat_clean",   "eat clean": "eat_clean",
-    "3": "build_muscle","เพิ่มกล้าม": "build_muscle","build muscle": "build_muscle",
-    "4": "no_goal",     "ยังไม่มี": "no_goal",     "no goal": "no_goal",
+    "1": "lose_weight",    "ลดน้ำหนัก": "lose_weight",      "lose weight": "lose_weight",
+    "2": "eat_clean",      "กินสะอาด": "eat_clean",          "eat clean": "eat_clean",
+                           "กินอาหารคลีน": "eat_clean",      "อาหารคลีน": "eat_clean",
+    "3": "build_muscle",   "เพิ่มกล้าม": "build_muscle",     "build muscle": "build_muscle",
+    "4": "no_goal",        "ยังไม่มี": "no_goal",            "no goal": "no_goal",
 }
 
 GOAL_LABEL = {
@@ -290,7 +299,9 @@ async def webhook(request: Request):
 @handler.add(FollowEvent)
 def handle_follow(event):
     get_or_create_user(event.source.user_id)
-    _reply(event.reply_token, ONBOARDING_MSG)
+    _reply(event.reply_token, ONBOARDING_MSG_1)
+    time.sleep(1)
+    _push(event.source.user_id, ONBOARDING_MSG_2)
 
 
 # ── TEXT ──────────────────────────────────────────────────────────────────────
