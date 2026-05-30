@@ -416,24 +416,38 @@ def test_conversation_history():
     run("Empty history → empty", len(trim_history([])) == 0)
 
 
+def count_distinct_days(meals: list) -> int:
+    """Pure helper — mirrors weekly summary distinct-day counting."""
+    return len({m["logged_at"][:10] for m in meals})
+
+
+def is_low_logging_week(days: int) -> bool:
+    """Pure helper — mirrors weekly summary low-log detection."""
+    return days <= 2
+
+
 def test_weekly_summary_logic():
-    print("=== Weekly summary logic (YOL-22) ===")
+    print("=== Weekly summary logic (YOL-22/27) ===")
     # Top dishes identified correctly
     meals_week = [
-        {"description": "ข้าวมันไก่"},
-        {"description": "ข้าวมันไก่"},
-        {"description": "กะเพราหมู"},
-        {"description": "ข้าวมันไก่"},
-        {"description": "ต้มยำกุ้ง"},
-        {"description": "กะเพราหมู"},
-        {"description": "ข้าวผัด"},
+        {"description": "ข้าวมันไก่", "logged_at": "2026-05-26T08:00:00"},
+        {"description": "ข้าวมันไก่", "logged_at": "2026-05-26T12:00:00"},
+        {"description": "กะเพราหมู",  "logged_at": "2026-05-27T08:00:00"},
+        {"description": "ข้าวมันไก่", "logged_at": "2026-05-27T12:00:00"},
+        {"description": "ต้มยำกุ้ง",  "logged_at": "2026-05-28T08:00:00"},
+        {"description": "กะเพราหมู",  "logged_at": "2026-05-28T12:00:00"},
+        {"description": "ข้าวผัด",    "logged_at": "2026-05-29T08:00:00"},
     ]
     top = get_top_dishes(meals_week)
     run("Top dish is ข้าวมันไก่", top[0] == "ข้าวมันไก่")
     run("Second dish is กะเพราหมู", top[1] == "กะเพราหมู")
     run("Top 3 returned", len(top) == 3)
 
-    # 0 meals → no Claude call (re-engagement branch)
+    # Multiple same dish → counted correctly
+    same_dish = [{"description": "ข้าวมันไก่", "logged_at": f"2026-05-2{i}T08:00:00"} for i in range(5)]
+    run("Same dish 5x → top dish correct", get_top_dishes(same_dish)[0] == "ข้าวมันไก่")
+
+    # 0 meals → re-engagement branch
     run("0 meals → empty top dishes", get_top_dishes([]) == [])
 
     # Distinct days count
@@ -442,8 +456,19 @@ def test_weekly_summary_logic():
         {"description": "y", "logged_at": "2026-05-26T13:00:00"},
         {"description": "z", "logged_at": "2026-05-27T08:00:00"},
     ]
-    days = len({m["logged_at"][:10] for m in meals_with_dates})
+    days = count_distinct_days(meals_with_dates)
     run("2 distinct days counted", days == 2)
+
+    # 7 days logged → correct count
+    meals_7 = [{"description": "x", "logged_at": f"2026-05-2{i}T08:00:00"} for i in range(7)]
+    run("7 days logged → count=7", count_distinct_days(meals_7) == 7)
+
+    # Low-logging detection (YOL-27)
+    run("0 days → low logging", is_low_logging_week(0))
+    run("1 day → low logging", is_low_logging_week(1))
+    run("2 days → low logging", is_low_logging_week(2))
+    run("3 days → not low logging", not is_low_logging_week(3))
+    run("7 days → not low logging", not is_low_logging_week(7))
 
 
 def test_conversational_whitelist():

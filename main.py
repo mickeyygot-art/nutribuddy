@@ -537,11 +537,11 @@ STRICT FORMATTING — LINE does not render markdown:
 # ── WEEKLY SUMMARY (Monday 08:00 Bangkok = Monday 01:00 UTC) ──────────────────
 
 def send_weekly_summaries():
-    # PLAN:
-    # 1. For each user fetch last 7 days of meals
-    # 2. If 0 meals → re-engagement message (no Claude call)
-    # 3. Otherwise count distinct days logged, find top dishes, build prompt
-    # 4. Push Claude-generated summary
+    # PLAN (YOL-27):
+    # 1. 0 meals → re-engagement, no Claude call
+    # 2. 1-2 days → warm low-logging prefix injected into prompt
+    # 3. Otherwise → full 4-part structured prompt with goal-specific guidance
+    from collections import Counter
     for user in get_all_users():
         try:
             meals = get_week_meals(user["id"])
@@ -553,34 +553,52 @@ def send_weekly_summaries():
                 _push(line_user_id, msg)
                 continue
 
-            # Count distinct days and most common dishes
-            from collections import Counter
             days_with_meals = len({m["logged_at"][:10] for m in meals})
             dish_counts = Counter(m["description"] for m in meals)
             top_dishes = ", ".join(d for d, _ in dish_counts.most_common(3))
-            goal_label = GOAL_LABEL.get(user["goal"], "no specific goal")
+            goal = user.get("goal", "no_goal")
+            goal_label = GOAL_LABEL.get(goal, "no specific goal")
             lang_word = "Thai" if lang == "th" else "English"
+
+            # Goal-specific guidance for Part 3 (observation) and Part 4 (tip)
+            goal_guidance = {
+                "lose_weight":  "Part 3: note balance of fried vs lighter meals. Part 4: suggest a lower-cal swap or smaller portion.",
+                "eat_clean":    "Part 3: note vegetable frequency this week. Part 4: suggest adding vegetables or reducing processed food.",
+                "build_muscle": "Part 3: note protein consistency across the week. Part 4: suggest a protein source to add next week.",
+                "no_goal":      "Part 3: give a general positive observation about variety or habits. Part 4: suggest a general positive habit (hydration, color variety, etc.).",
+            }.get(goal, "Part 3: general positive observation. Part 4: practical eating habit suggestion.")
+
+            # Warm prefix for low-logging weeks (1-2 days)
+            low_log_note = ""
+            if days_with_meals <= 2:
+                low_log_note = (
+                    f"Note: user only logged {days_with_meals} day(s) this week. "
+                    "Frame Part 1 warmly as a good start, not a failure. "
+                    f"TH prefix example: 'สัปดาห์นี้เริ่มบันทึกแล้ว {days_with_meals} วัน — ดีมากที่เริ่มต้น!'"
+                )
 
             prompt = f"""Weekly summary for a NutriBuddy user.
 Goal: {goal_label}
 Days logged this week: {days_with_meals}/7
 Most eaten dishes: {top_dishes}
+{low_log_note}
 
-Write a 4-sentence weekly recap:
-1. Days logged — one warm sentence mentioning they logged {days_with_meals} out of 7 days
-2. Most common meals — one sentence naming the top dishes
-3. Goal note — one sentence on how this week connected to their goal
-4. Next week tip — one specific, practical suggestion for next week
+Write exactly 4 sentences — one per part, in order:
+Part 1 — Days logged: warm sentence noting they logged {days_with_meals} out of 7 days (frame as progress).
+Part 2 — What they ate most: one sentence naming the top dishes ({top_dishes}).
+Part 3 — Goal observation: {goal_guidance.split("Part 3:")[1].split(".")[0].strip()}
+Part 4 — One focus tip for this week: {goal_guidance.split("Part 4:")[1].strip()} This part must always be included.
 
 STRICT FORMATTING — LINE does not render markdown:
 - NEVER use **, *, __, _, #, or any markdown symbols
+- NEVER use bullet points or numbered lists
 - Plain text only, like an SMS message
-- Max 1 emoji total, at the end of a sentence only
+- Max 1 emoji total, placed at the end of the last sentence only
 - Warm friend tone, reply in {lang_word}"""
 
             resp = claude.messages.create(
                 model="claude-sonnet-4-6",
-                max_tokens=250,
+                max_tokens=280,
                 messages=[{"role": "user", "content": prompt}],
             )
             _push(line_user_id, resp.content[0].text)
