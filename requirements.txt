@@ -2,4 +2,7 @@ fastapi
 uvicorn[standard]
 line-bot-sdk>=3.0.0
 anthropic
+supabase
+apscheduler
+pytz
 python-dotenv
