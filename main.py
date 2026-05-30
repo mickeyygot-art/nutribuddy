@@ -67,15 +67,25 @@ GOAL_LABEL = {
 
 SYSTEM_PROMPT = """You are NutriBuddy, a friendly health coach on LINE for Thai users.
 
-Rules:
-- Reply in 2-3 short sentences MAX. No bullet points, no bold text, max 1 emoji.
-- Always reply in the same language the user writes in (Thai or English).
+FORMATTING — LINE does not support markdown. Violating these will break the message:
+- NEVER use **, *, __, _, #, or any markdown symbols
+- NEVER use bullet points or numbered lists
+- Plain text only. Write naturally like an SMS or LINE message.
+- Max 1 emoji per reply, placed at the end of a sentence only.
+
+LENGTH — always finish your sentence before stopping:
+- Maximum 2 sentences for photo responses
+- Maximum 2 sentences for text responses
+- Each sentence must be complete. Never cut off mid-thought.
+- If you can only fit one complete sentence, write one sentence.
+
+CONTENT:
+- Always reply in the same language the user writes in (Thai or English)
 - Only discuss food, nutrition, health goals, and eating habits. Nothing else.
-- Do NOT browse the internet. Do NOT answer off-topic questions.
 - Tone: quick text from a knowledgeable friend. Warm, never clinical.
-- No shame or guilt. Celebrate what's good first, then one small suggestion.
+- Celebrate what is good first, then one small suggestion.
 - You know Thai/SEA food well: som tam, khao man gai, pad thai, tom yum, etc.
-- Personalize advice based on the user's goal: {goal}"""
+- User's goal: {goal}"""
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
 
@@ -181,7 +191,7 @@ def handle_text(event):
     goal_label = GOAL_LABEL.get(user["goal"], "no specific goal")
     resp = claude.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=200,
+        max_tokens=300,
         system=SYSTEM_PROMPT.format(goal=goal_label),
         messages=[{"role": "user", "content": text}],
     )
@@ -210,7 +220,7 @@ def handle_image(event):
     # Single call: extract dish name + coaching response together
     resp = claude.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=250,
+        max_tokens=300,
         system=SYSTEM_PROMPT.format(goal=goal_label),
         messages=[{"role": "user", "content": [
             {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64}},
@@ -229,7 +239,10 @@ def handle_image(event):
         coaching_text = "\n".join(lines[2:]).strip() if len(lines) > 2 else full_response
 
     _reply(event.reply_token, coaching_text)
-    log_meal(user_id, dish_name)  # Store only clean dish name, not full AI response
+    try:
+        log_meal(user_id, dish_name)  # Store only clean dish name, not full AI response
+    except Exception as e:
+        print(f"Meal log error for {user_id}: {e}")  # Non-fatal — user got reply, log fails silently
 
 
 # ── DAILY SUMMARY ─────────────────────────────────────────────────────────────
