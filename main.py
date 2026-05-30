@@ -72,6 +72,12 @@ UNBLOCK_KEYWORDS = {
     "start", "restart", "sorry",
 }
 
+CONVERSATIONAL_WHITELIST = {
+    "โอเค", "ok", "okay", "ได้", "ครับ", "ค่ะ", "นะ",
+    "yes", "no", "ใช่", "ไม่", "ขอบคุณ", "thanks",
+    "บอกไปแล้ว", "บอกแล้ว", "แล้ว", "เข้าใจ",
+}
+
 GOAL_MAP = {
     "1": "lose_weight", "ลดน้ำหนัก": "lose_weight", "lose weight": "lose_weight",
     "2": "eat_clean",   "กินสะอาด": "eat_clean",   "eat clean": "eat_clean",
@@ -160,6 +166,40 @@ def clean_for_line(text: str) -> str:
 def is_unblock_command(text: str) -> bool:
     t = text.lower().strip()
     return any(kw in t for kw in UNBLOCK_KEYWORDS)
+
+
+def is_conversational(text: str) -> bool:
+    """YOL-25: Returns True if message is a short acknowledgement — skip off-topic classifier."""
+    t = text.strip()
+    if len(t) <= 10:
+        return True
+    return t.lower() in CONVERSATIONAL_WHITELIST
+
+
+def classify_meal_report(text: str) -> bool:
+    """YOL-24: Returns True if the message is reporting a meal the user ate."""
+    resp = claude.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=5,
+        messages=[{"role": "user", "content":
+            f"Is this message reporting a meal the user just ate or ate earlier today? Reply MEAL or NOT only.\n"
+            f"MEAL examples: 'กินข้าวมันไก่มาเมื่อเช้า', 'just had pad thai for lunch', 'เที่ยงกินกะเพรา'\n"
+            f"NOT examples: 'is pad thai healthy?', 'what should I eat tonight?', 'ขอบคุณ'\n\n"
+            f"Message: {text}"}]
+    )
+    return resp.content[0].text.strip().upper() == "MEAL"
+
+
+def extract_dish_from_text(text: str) -> str:
+    """YOL-24: Extract dish name only from a meal report message."""
+    resp = claude.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=30,
+        messages=[{"role": "user", "content":
+            f"Extract the dish name only from this message. Reply with just the dish name, nothing else.\n\n"
+            f"Message: {text}"}]
+    )
+    return resp.content[0].text.strip()[:200]
 
 
 def classify_off_topic(text: str) -> bool:
@@ -293,8 +333,8 @@ def handle_text(event):
         _reply(event.reply_token, msg)
         return
 
-    # Off-topic?
-    if classify_off_topic(text):
+    # YOL-25: Skip off-topic classifier for short / conversational messages
+    if not is_conversational(text) and classify_off_topic(text):
         count = increment_off_topic(user_id)
         if count >= 3:
             msg = BLOCKED_TH if lang == "th" else BLOCKED_EN
@@ -304,6 +344,15 @@ def handle_text(event):
             msg = OFFTOPIC_TH if lang == "th" else OFFTOPIC_EN
         _reply(event.reply_token, msg)
         return
+
+    # YOL-24: Silently log meal if user is reporting what they ate in text
+    try:
+        if classify_meal_report(text):
+            dish = extract_dish_from_text(text)
+            if dish:
+                log_meal(user_id, dish)
+    except Exception as e:
+        print(f"Text meal log error for {user_id}: {e}")  # Non-fatal
 
     # YOL-16: Meal history intent detection
     date_intent = detect_date_intent(text)

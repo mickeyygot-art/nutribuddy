@@ -119,6 +119,26 @@ def check_cron_auth(header_secret: str, env_secret: str) -> bool:
     return header_secret == env_secret
 
 
+CONVERSATIONAL_WHITELIST = {
+    "โอเค", "ok", "okay", "ได้", "ครับ", "ค่ะ", "นะ",
+    "yes", "no", "ใช่", "ไม่", "ขอบคุณ", "thanks",
+    "บอกไปแล้ว", "บอกแล้ว", "แล้ว", "เข้าใจ",
+}
+
+
+def is_conversational(text: str) -> bool:
+    """Pure helper — mirrors main.py is_conversational."""
+    t = text.strip()
+    if len(t) <= 10:
+        return True
+    return t.lower() in CONVERSATIONAL_WHITELIST
+
+
+def is_meal_report_result(result: str) -> bool:
+    """Pure helper — mirrors main.py classify_meal_report result check."""
+    return result.strip().upper() == "MEAL"
+
+
 def is_unblock_command(text: str) -> bool:
     """Pure helper — mirrors main.py is_unblock_command."""
     UNBLOCK_KEYWORDS = {
@@ -423,6 +443,38 @@ def test_weekly_summary_logic():
     run("2 distinct days counted", days == 2)
 
 
+def test_conversational_whitelist():
+    print("=== Conversational whitelist (YOL-25) ===")
+    # Whitelist items → skip classifier
+    run("'บอกไปแล้ว' → conversational", is_conversational("บอกไปแล้ว"))
+    run("'โอเค' → conversational", is_conversational("โอเค"))
+    run("'ok' → conversational", is_conversational("ok"))
+    run("'ขอบคุณ' → conversational", is_conversational("ขอบคุณ"))
+    run("'thanks' → conversational", is_conversational("thanks"))
+    run("'ใช่' → conversational", is_conversational("ใช่"))
+    run("'เข้าใจ' → conversational", is_conversational("เข้าใจ"))
+    # ≤ 10 chars → skip regardless of content
+    run("9-char message → conversational", is_conversational("123456789"))
+    run("Exactly 10 chars → conversational", is_conversational("1234567890"))
+    # > 10 chars + not in whitelist → goes to classifier
+    run("Long food question → not conversational", not is_conversational("is pad thai healthy?"))
+    run("Long off-topic → not conversational", not is_conversational("what is the stock price today?"))
+    run("11 chars unknown → not conversational", not is_conversational("12345678901"))
+
+
+def test_meal_report_detection():
+    print("=== Meal report detection (YOL-24) ===")
+    # MEAL result → logs
+    run("'MEAL' → logged", is_meal_report_result("MEAL"))
+    run("'meal' lowercase → logged", is_meal_report_result("meal"))
+    run("'MEAL ' trailing space → logged", is_meal_report_result("MEAL "))
+    # NOT result → not logged
+    run("'NOT' → not logged", not is_meal_report_result("NOT"))
+    run("'not' lowercase → not logged", not is_meal_report_result("not"))
+    run("'NO' → not logged", not is_meal_report_result("NO"))
+    run("Empty → not logged", not is_meal_report_result(""))
+
+
 def test_clean_for_line():
     print("=== Markdown + emoji stripping ===")
     run("**bold** removed", clean_for_line("**เช้า** — ไก่ย่าง") == "เช้า — ไก่ย่าง")
@@ -456,6 +508,8 @@ if __name__ == "__main__":
         test_deep_dish_variant,
         test_conversation_history,
         test_weekly_summary_logic,
+        test_conversational_whitelist,
+        test_meal_report_detection,
         test_clean_for_line,
     ]
     passed = 0
