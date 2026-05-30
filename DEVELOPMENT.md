@@ -1,5 +1,43 @@
 # NutriBuddy — Development Guide
 
+## Planning Steps — Required Before Writing Any Code
+
+Every task from Linear must go through these steps before implementation starts. No exceptions, even for "small" changes.
+
+**Step 1 — Read the Linear issue fully**
+Understand what is being asked, why it exists, and what "done" looks like. If the issue is unclear, ask the product agent (Cowork session) before proceeding.
+
+**Step 2 — Identify all affected files**
+List every file that will change: `main.py`, `database.py`, `schema.sql`, `requirements.txt`, etc. If a new DB table or column is needed, that goes in `schema.sql` and must be run in Supabase before the code goes live.
+
+**Step 3 — Check for API cost impact**
+Does this add new Claude calls? How many per user per day? Update the spending limit estimate in the "API Usage Limits" section below if so.
+
+**Step 4 — Write a brief plan in comments first**
+Before writing implementation code, add a `# PLAN:` comment block at the top of the function you're building. Example:
+```python
+# PLAN:
+# 1. Check if user exists in DB
+# 2. If new user, insert with default goal=no_goal
+# 3. Return user dict either way
+```
+
+**Step 5 — Implement against the plan**
+Write code that matches the plan comments. If you deviate, update the comments.
+
+**Step 6 — Test before committing**
+Run the relevant test in `tests/test_logic.py`. If the feature has no test yet, write one first.
+
+**Step 7 — Commit with Linear issue reference**
+```bash
+git commit -m "feat: [description] (YOL-XX)"
+```
+
+**Step 8 — Update Linear issue**
+Mark the issue as Done and add a brief comment on what was implemented.
+
+---
+
 ## Stack
 - **Runtime**: Python 3.12, FastAPI, Uvicorn
 - **AI**: Anthropic Claude API (claude-sonnet-4-6 for responses, claude-haiku-4-5 for classification)

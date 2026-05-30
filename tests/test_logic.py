@@ -1,0 +1,226 @@
+"""
+NutriBuddy — Logic Unit Tests
+Run: python tests/test_logic.py
+These tests cover all pure logic functions (no API calls, no DB).
+"""
+
+from datetime import datetime, timezone, timedelta
+
+
+# ── HELPERS (copied from main.py / database.py for isolated testing) ──────────
+
+def is_thai(text: str) -> bool:
+    return any("฀" <= c <= "๿" for c in text)
+
+
+def detect_goal(text: str) -> str | None:
+    GOAL_MAP = {
+        "1": "lose_weight", "ลดน้ำหนัก": "lose_weight", "lose weight": "lose_weight",
+        "2": "eat_clean",   "กินสะอาด": "eat_clean",   "eat clean": "eat_clean",
+        "3": "build_muscle","เพิ่มกล้าม": "build_muscle","build muscle": "build_muscle",
+        "4": "no_goal",     "ยังไม่มี": "no_goal",     "no goal": "no_goal",
+    }
+    t = text.lower().strip()
+    for key, goal in GOAL_MAP.items():
+        if key in t:
+            return goal
+    return None
+
+
+def extract_dish(full_response: str) -> tuple[str, str]:
+    lines = full_response.strip().splitlines()
+    dish_name = "unknown dish"
+    coaching_text = full_response
+    if lines and lines[0].upper().startswith("DISH:"):
+        dish_name = lines[0][5:].strip()
+        coaching_text = "\n".join(lines[2:]).strip() if len(lines) > 2 else full_response
+    return dish_name, coaching_text
+
+
+def build_summary_context(meals: list) -> tuple[str, bool]:
+    by_type = {}
+    for m in meals:
+        by_type.setdefault(m["meal_type"], []).append(m["description"])
+    meal_lines = "\n".join(
+        f"- {mtype.capitalize()}: {', '.join(dishes)}"
+        for mtype, dishes in by_type.items()
+    )
+    return meal_lines, "dinner" in by_type
+
+
+def meal_type_from_hour(hour: int) -> str:
+    if 6 <= hour <= 10:
+        return "breakfast"
+    elif 11 <= hour <= 14:
+        return "lunch"
+    elif 15 <= hour <= 17:
+        return "snack"
+    elif 18 <= hour <= 21:
+        return "dinner"
+    return "late_snack"
+
+
+def check_cron_auth(header_secret: str, env_secret: str) -> bool:
+    if not env_secret:
+        return False
+    return header_secret == env_secret
+
+
+def simulate_block_state(current_count: int, blocked_until_str: str | None = None) -> tuple[str, int]:
+    now = datetime.now(timezone.utc)
+    if blocked_until_str:
+        blocked_until = datetime.fromisoformat(blocked_until_str)
+        if now < blocked_until:
+            return "BLOCKED", current_count
+    new_count = current_count + 1
+    if new_count >= 3:
+        return "NOW_BLOCKED", 0
+    return "WARNED", new_count
+
+
+# ── TESTS ─────────────────────────────────────────────────────────────────────
+
+def run(label, condition):
+    status = "✅" if condition else "❌"
+    print(f"  {status} {label}")
+    if not condition:
+        raise AssertionError(f"FAILED: {label}")
+
+
+def test_thai_detection():
+    print("=== Thai detection ===")
+    run("Pure Thai", is_thai("สวัสดี"))
+    run("Thai dish name", is_thai("ข้าวมันไก่"))
+    run("English → False", not is_thai("Hello"))
+    run("Mixed → True", is_thai("hello สวัสดี"))
+    run("Numbers → False", not is_thai("1234"))
+    run("Empty → False", not is_thai(""))
+
+
+def test_goal_detection():
+    print("=== Goal detection ===")
+    run("Number 1 → lose_weight", detect_goal("1") == "lose_weight")
+    run("Thai lose weight", detect_goal("ลดน้ำหนัก") == "lose_weight")
+    run("Thai sentence", detect_goal("อยากลดน้ำหนักครับ") == "lose_weight")
+    run("Number 3 → build_muscle", detect_goal("3") == "build_muscle")
+    run("Number 4 → no_goal", detect_goal("4") == "no_goal")
+    run("Off-topic → None", detect_goal("what is the weather?") is None)
+    run("Empty → None", detect_goal("") is None)
+    run("English goal change", detect_goal("change to eat clean") == "eat_clean")
+
+
+def test_dish_extraction():
+    print("=== Dish name extraction ===")
+    d, c = extract_dish("DISH: ข้าวมันไก่\n\nโปรตีนดีมากเลย!")
+    run("Thai dish extracted", d == "ข้าวมันไก่")
+    run("Coaching text returned", c == "โปรตีนดีมากเลย!")
+
+    d, c = extract_dish("DISH: Pad Thai\n\nGreat choice!")
+    run("English dish extracted", d == "Pad Thai")
+
+    d, c = extract_dish("dish: som tam\n\nLooks healthy!")
+    run("Case insensitive", d == "som tam")
+
+    d, c = extract_dish("No dish prefix here, just coaching.")
+    run("No prefix → unknown dish", d == "unknown dish")
+    run("No prefix → full text as coaching", c == "No dish prefix here, just coaching.")
+
+    d, c = extract_dish("DISH: ต้มยำกุ้ง")
+    run("Dish only, no coaching", d == "ต้มยำกุ้ง")
+
+
+def test_summary_context():
+    print("=== Daily summary context ===")
+    meals_full = [
+        {"meal_type": "breakfast", "description": "โจ๊กหมู"},
+        {"meal_type": "lunch", "description": "ข้าวมันไก่"},
+        {"meal_type": "dinner", "description": "ต้มยำกุ้ง"},
+    ]
+    lines, has_dinner = build_summary_context(meals_full)
+    run("Full day has_dinner=True", has_dinner)
+    run("Breakfast in lines", "Breakfast: โจ๊กหมู" in lines)
+    run("Dinner in lines", "Dinner: ต้มยำกุ้ง" in lines)
+
+    _, has_dinner = build_summary_context([{"meal_type": "lunch", "description": "x"}])
+    run("No dinner → has_dinner=False", not has_dinner)
+
+    meals_multi = [
+        {"meal_type": "snack", "description": "กล้วย"},
+        {"meal_type": "snack", "description": "โยเกิร์ต"},
+    ]
+    lines, _ = build_summary_context(meals_multi)
+    run("Multiple snacks merged", "กล้วย, โยเกิร์ต" in lines)
+
+    lines, has_dinner = build_summary_context([])
+    run("Empty meals → empty lines", lines == "")
+    run("Empty meals → has_dinner=False", not has_dinner)
+
+
+def test_meal_type_inference():
+    print("=== Meal type by hour ===")
+    run("06:00 → breakfast", meal_type_from_hour(6) == "breakfast")
+    run("10:00 → breakfast", meal_type_from_hour(10) == "breakfast")
+    run("11:00 → lunch", meal_type_from_hour(11) == "lunch")
+    run("14:00 → lunch", meal_type_from_hour(14) == "lunch")
+    run("15:00 → snack", meal_type_from_hour(15) == "snack")
+    run("18:00 → dinner", meal_type_from_hour(18) == "dinner")
+    run("21:00 → dinner", meal_type_from_hour(21) == "dinner")
+    run("22:00 → late_snack", meal_type_from_hour(22) == "late_snack")
+    run("00:00 → late_snack", meal_type_from_hour(0) == "late_snack")
+
+
+def test_cron_auth():
+    print("=== CRON auth ===")
+    run("Correct secret → authorized", check_cron_auth("abc123", "abc123"))
+    run("Wrong secret → forbidden", not check_cron_auth("wrong", "abc123"))
+    run("Empty header → forbidden", not check_cron_auth("", "abc123"))
+    run("No env var → forbidden", not check_cron_auth("abc123", ""))
+    run("Case sensitive", not check_cron_auth("ABC123", "abc123"))
+
+
+def test_off_topic_block():
+    print("=== Off-topic block state machine ===")
+    state, count = simulate_block_state(0)
+    run("Strike 1 → WARNED, count=1", state == "WARNED" and count == 1)
+
+    state, count = simulate_block_state(1)
+    run("Strike 2 → WARNED, count=2", state == "WARNED" and count == 2)
+
+    state, count = simulate_block_state(2)
+    run("Strike 3 → NOW_BLOCKED, count=0", state == "NOW_BLOCKED" and count == 0)
+
+    future = (datetime.now(timezone.utc) + timedelta(hours=3)).isoformat()
+    state, _ = simulate_block_state(0, future)
+    run("Active block → BLOCKED", state == "BLOCKED")
+
+    past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    state, count = simulate_block_state(0, past)
+    run("Expired block → resets to WARNED", state == "WARNED" and count == 1)
+
+
+# ── RUNNER ────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    tests = [
+        test_thai_detection,
+        test_goal_detection,
+        test_dish_extraction,
+        test_summary_context,
+        test_meal_type_inference,
+        test_cron_auth,
+        test_off_topic_block,
+    ]
+    passed = 0
+    for t in tests:
+        try:
+            t()
+            passed += 1
+            print()
+        except AssertionError as e:
+            print(f"\n  💥 {e}\n")
+
+    total = len(tests)
+    print(f"{'='*40}")
+    print(f"Results: {passed}/{total} test suites passed")
+    if passed < total:
+        exit(1)
