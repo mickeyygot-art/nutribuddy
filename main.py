@@ -105,6 +105,37 @@ def detect_goal(text: str) -> str | None:
     return None
 
 
+def clean_for_line(text: str) -> str:
+    """Strip markdown and limit to 1 emoji. Applied to every outgoing message."""
+    import re
+    # Remove markdown
+    text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
+    text = re.sub(r'\*(.*?)\*', r'\1', text)
+    text = re.sub(r'__(.*?)__', r'\1', text)
+    text = re.sub(r'_(.*?)_', r'\1', text)
+    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^[-*]\s+', '', text, flags=re.MULTILINE)
+
+    # Keep only the first emoji found, remove the rest
+    emoji_pattern = re.compile(
+        "[\U00002600-\U000027BF"
+        "\U0001F300-\U0001F9FF"
+        "\U0001FA00-\U0001FA9F"
+        "\U00002702-\U000027B0"
+        "\U0000FE00-\U0000FE0F"
+        "\U0001F1E0-\U0001F1FF]+",
+        flags=re.UNICODE
+    )
+    emojis_found = emoji_pattern.findall(text)
+    if len(emojis_found) > 1:
+        first_emoji = emojis_found[0]
+        # Remove all emojis, then add the first one back at the end
+        text = emoji_pattern.sub('', text).strip()
+        text = text + ' ' + first_emoji
+
+    return text.strip()
+
+
 def classify_off_topic(text: str) -> bool:
     """Returns True if message is NOT related to food/health."""
     resp = claude.messages.create(
@@ -164,14 +195,14 @@ def build_meal_history_context(meals: list, date_str: str) -> str:
 def _reply(reply_token: str, text: str):
     with ApiClient(configuration) as api_client:
         MessagingApi(api_client).reply_message(
-            ReplyMessageRequest(reply_token=reply_token, messages=[TextMessage(text=text)])
+            ReplyMessageRequest(reply_token=reply_token, messages=[TextMessage(text=clean_for_line(text))])
         )
 
 
 def _push(line_user_id: str, text: str):
     with ApiClient(configuration) as api_client:
         MessagingApi(api_client).push_message(
-            PushMessageRequest(to=line_user_id, messages=[TextMessage(text=text)])
+            PushMessageRequest(to=line_user_id, messages=[TextMessage(text=clean_for_line(text))])
         )
 
 
@@ -362,7 +393,13 @@ Write a structured summary following this exact template:
 {"3. Dinner wish — one kind, brief sentence wishing them a healthy dinner" if not has_dinner else ""}
 {"3" if not has_dinner else "3"}. Tomorrow tip — one specific, practical suggestion for tomorrow
 
-Rules: reply in {lang_word}. Max 4 short sentences total. Max 1 emoji. No bullet points in the reply. Warm friend tone."""
+STRICT FORMATTING — LINE does not render markdown:
+- NEVER use **, *, __, _, #, or any markdown symbols
+- NEVER use bullet points or numbered lists in the reply
+- Plain text only, like an SMS message
+- Max 1 emoji total, at the end of a sentence only
+- Max 4 short sentences total
+- Warm friend tone, reply in {lang_word}"""
 
             resp = claude.messages.create(
                 model="claude-sonnet-4-6",

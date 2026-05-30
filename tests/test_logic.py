@@ -91,6 +91,28 @@ def validate_date_intent(date_str: str, today_bkk_date) -> str:
         return "NO"
 
 
+def clean_for_line(text: str) -> str:
+    import re
+    text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
+    text = re.sub(r'\*(.*?)\*', r'\1', text)
+    text = re.sub(r'__(.*?)__', r'\1', text)
+    text = re.sub(r'_(.*?)_', r'\1', text)
+    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^[-*]\s+', '', text, flags=re.MULTILINE)
+    emoji_pattern = re.compile(
+        "[\U00002600-\U000027BF\U0001F300-\U0001F9FF"
+        "\U0001FA00-\U0001FA9F\U00002702-\U000027B0"
+        "\U0000FE00-\U0000FE0F\U0001F1E0-\U0001F1FF]+",
+        flags=re.UNICODE
+    )
+    emojis_found = emoji_pattern.findall(text)
+    if len(emojis_found) > 1:
+        first_emoji = emojis_found[0]
+        text = emoji_pattern.sub('', text).strip()
+        text = text + ' ' + first_emoji
+    return text.strip()
+
+
 def check_cron_auth(header_secret: str, env_secret: str) -> bool:
     if not env_secret:
         return False
@@ -279,6 +301,22 @@ def test_off_topic_block():
     run("Expired block → resets to WARNED", state == "WARNED" and count == 1)
 
 
+def test_clean_for_line():
+    print("=== Markdown + emoji stripping ===")
+    run("**bold** removed", clean_for_line("**เช้า** — ไก่ย่าง") == "เช้า — ไก่ย่าง")
+    run("*italic* removed", clean_for_line("*great* choice") == "great choice")
+    run("__bold__ removed", clean_for_line("__เที่ยง__ กะเพรา") == "เที่ยง กะเพรา")
+    run("_italic_ removed", clean_for_line("_good_ job") == "good job")
+    run("# heading removed", clean_for_line("# Summary\ntext") == "Summary\ntext")
+    run("bullet - removed", clean_for_line("- item one\n- item two") == "item one\nitem two")
+    run("clean text unchanged", clean_for_line("โปรตีนดีมากเลย 💪") == "โปรตีนดีมากเลย 💪")
+    run("mixed Thai+bold", clean_for_line("**เช้า** ไก่ย่าง **เที่ยง** กะเพรา") == "เช้า ไก่ย่าง เที่ยง กะเพรา")
+    run("1 emoji unchanged", clean_for_line("ดีมาก 🍽️").endswith("🍽️"))
+    run("2 emojis → keep first only", clean_for_line("ดี 😄 มาก 👏").count("😄") == 1 and "👏" not in clean_for_line("ดี 😄 มาก 👏"))
+    run("3 emojis → keep first only", clean_for_line("ก 🍗 ข 💪 ค 🥦").count("🍗") == 1 and "💪" not in clean_for_line("ก 🍗 ข 💪 ค 🥦"))
+    run("no emoji unchanged", clean_for_line("ข้าวมันไก่อร่อย") == "ข้าวมันไก่อร่อย")
+
+
 # ── RUNNER ────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -291,6 +329,7 @@ if __name__ == "__main__":
         test_cron_auth,
         test_off_topic_block,
         test_meal_history_context,
+        test_clean_for_line,
     ]
     passed = 0
     for t in tests:
