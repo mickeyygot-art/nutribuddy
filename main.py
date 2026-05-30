@@ -21,7 +21,7 @@ configuration = Configuration(access_token=os.environ["LINE_CHANNEL_ACCESS_TOKEN
 handler = WebhookHandler(os.environ["LINE_CHANNEL_SECRET"])
 
 # ── Anthropic setup ─────────────────────────────────────────────────────────
-claude = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+claude = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"].strip())
 
 # ── NutriBuddy system prompt ─────────────────────────────────────────────────
 SYSTEM_PROMPT = """You are NutriBuddy, a warm and encouraging AI health coach on LINE.
