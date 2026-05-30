@@ -486,9 +486,9 @@ def send_daily_summaries():
             line_user_id = user["line_user_id"]
 
             if not meals:
-                msg = ("วันนี้ยังไม่ได้ส่งรูปอาหารเลยนะ — พรุ่งนี้ลองส่งมาให้ NutriBuddy ดูได้เลย! 🍽️"
+                msg = ("วันนี้ยังไม่ได้บันทึกอาหารเลยนะ ถ้าเย็นนี้มีมื้ออร่อย ส่งรูปมาให้ดูได้เลย 🍽️"
                        if lang == "th" else
-                       "No meals logged today — try sending a food photo tomorrow! 🍽️")
+                       "No meals logged today — if you're having dinner tonight, send a photo and let's see it 🍽️")
                 _push(line_user_id, msg)
                 continue
 
