@@ -2,6 +2,7 @@ import os
 from datetime import datetime, timezone, timedelta
 from supabase import create_client, Client
 import pytz
+from typing import Optional
 
 supabase: Client = create_client(
     os.environ["SUPABASE_URL"].strip(),
@@ -58,6 +59,38 @@ def log_meal(user_id: str, description: str):
         "description": description[:200],
         "meal_type": _meal_type_from_time(),
     }).execute()
+
+
+def get_meals_by_date_range(user_id: str, from_date: datetime, to_date: datetime) -> list:
+    # PLAN:
+    # 1. Hard cap: clamp from_date to at most 30 days ago (Bangkok midnight)
+    # 2. Convert both bounds to UTC ISO strings for Supabase query
+    # 3. Return meals ordered by logged_at
+    thirty_days_ago = (
+        datetime.now(BKK)
+        .replace(hour=0, minute=0, second=0, microsecond=0)
+        - timedelta(days=30)
+    )
+    if from_date.tzinfo is None:
+        from_date = BKK.localize(from_date)
+    if to_date.tzinfo is None:
+        to_date = BKK.localize(to_date)
+    if from_date < thirty_days_ago:
+        from_date = thirty_days_ago
+
+    from_utc = from_date.astimezone(timezone.utc).isoformat()
+    to_utc = to_date.astimezone(timezone.utc).isoformat()
+
+    return (
+        supabase.table("meals")
+        .select("*")
+        .eq("user_id", user_id)
+        .gte("logged_at", from_utc)
+        .lt("logged_at", to_utc)
+        .order("logged_at")
+        .execute()
+        .data
+    )
 
 
 def get_today_meals(user_id: str) -> list:

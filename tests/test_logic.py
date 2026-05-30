@@ -5,6 +5,9 @@ These tests cover all pure logic functions (no API calls, no DB).
 """
 
 from datetime import datetime, timezone, timedelta
+import pytz
+
+BKK = pytz.timezone("Asia/Bangkok")
 
 
 # ── HELPERS (copied from main.py / database.py for isolated testing) ──────────
@@ -58,6 +61,34 @@ def meal_type_from_hour(hour: int) -> str:
     elif 18 <= hour <= 21:
         return "dinner"
     return "late_snack"
+
+
+def build_meal_history_context(meals: list, date_str: str) -> str:
+    """Pure helper — mirrors main.py build_meal_history_context."""
+    if not meals:
+        return f"(No meals logged for {date_str})"
+    by_type: dict = {}
+    for m in meals:
+        by_type.setdefault(m["meal_type"], []).append(m["description"])
+    parts = ", ".join(
+        f"{mtype.capitalize()}: {', '.join(dishes)}"
+        for mtype, dishes in by_type.items()
+    )
+    return f"Meal history for {date_str}: {parts}"
+
+
+def validate_date_intent(date_str: str, today_bkk_date) -> str:
+    """Pure helper — mirrors the date-validation logic from detect_date_intent (no Haiku call)."""
+    if date_str.upper() == "NO":
+        return "NO"
+    try:
+        asked_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+        cutoff = today_bkk_date - timedelta(days=30)
+        if asked_date < cutoff:
+            return "TOO_OLD"
+        return date_str
+    except ValueError:
+        return "NO"
 
 
 def check_cron_auth(header_secret: str, env_secret: str) -> bool:
@@ -178,6 +209,56 @@ def test_cron_auth():
     run("Case sensitive", not check_cron_auth("ABC123", "abc123"))
 
 
+def test_meal_history_context():
+    print("=== Meal history context (YOL-16) ===")
+    today = datetime.now(BKK).date()
+    today_str = str(today)
+
+    # Today's meals → context string formatted correctly
+    meals_today = [
+        {"meal_type": "breakfast", "description": "โจ๊กหมู"},
+        {"meal_type": "lunch", "description": "ข้าวมันไก่"},
+    ]
+    ctx = build_meal_history_context(meals_today, today_str)
+    run("Today meals → correct prefix", ctx.startswith(f"Meal history for {today_str}:"))
+    run("Today meals → breakfast listed", "Breakfast: โจ๊กหมู" in ctx)
+    run("Today meals → lunch listed", "Lunch: ข้าวมันไก่" in ctx)
+
+    # Yesterday resolved within 30 days → valid date
+    yesterday_str = str(today - timedelta(days=1))
+    run("Yesterday within 30 days → not TOO_OLD", validate_date_intent(yesterday_str, today) == yesterday_str)
+
+    # Specific date within 30 days → passed through
+    date_28_days = str(today - timedelta(days=28))
+    run("28 days ago → valid", validate_date_intent(date_28_days, today) == date_28_days)
+
+    # Date older than 30 days → TOO_OLD
+    date_31_days = str(today - timedelta(days=31))
+    run("31 days ago → TOO_OLD", validate_date_intent(date_31_days, today) == "TOO_OLD")
+
+    # Exactly 30 days ago is still valid (boundary)
+    date_30_days = str(today - timedelta(days=30))
+    run("Exactly 30 days ago → valid", validate_date_intent(date_30_days, today) == date_30_days)
+
+    # No meals on requested date → "no meals logged" context
+    ctx_empty = build_meal_history_context([], "2026-05-01")
+    run("No meals → no meals logged context", ctx_empty == "(No meals logged for 2026-05-01)")
+
+    # Multiple meals same type → both listed
+    meals_multi = [
+        {"meal_type": "snack", "description": "กล้วย"},
+        {"meal_type": "snack", "description": "โยเกิร์ต"},
+    ]
+    ctx_multi = build_meal_history_context(meals_multi, "2026-05-20")
+    run("Multiple snacks → both listed", "กล้วย, โยเกิร์ต" in ctx_multi)
+
+    # Non-history question → "NO" passes through unchanged
+    run("NO intent → NO", validate_date_intent("NO", today) == "NO")
+
+    # Malformed date from Haiku → treated as NO
+    run("Malformed date → NO", validate_date_intent("not-a-date", today) == "NO")
+
+
 def test_off_topic_block():
     print("=== Off-topic block state machine ===")
     state, count = simulate_block_state(0)
@@ -209,6 +290,7 @@ if __name__ == "__main__":
         test_meal_type_inference,
         test_cron_auth,
         test_off_topic_block,
+        test_meal_history_context,
     ]
     passed = 0
     for t in tests:

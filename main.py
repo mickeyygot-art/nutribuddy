@@ -1,5 +1,6 @@
 import os
 import base64
+from datetime import datetime, timedelta
 from fastapi import FastAPI, Request, HTTPException
 from linebot.v3 import WebhookHandler
 from linebot.v3.messaging import (
@@ -16,8 +17,8 @@ import pytz
 
 from database import (
     get_or_create_user, update_user_goal, update_user_language,
-    log_meal, get_today_meals, is_blocked, increment_off_topic,
-    get_all_users,
+    log_meal, get_today_meals, get_meals_by_date_range,
+    is_blocked, increment_off_topic, get_all_users,
 )
 
 app = FastAPI()
@@ -50,6 +51,9 @@ WARN_2_EN = "We've gone off-topic a couple of times! NutriBuddy only covers food
 
 OFFTOPIC_TH = "NutriBuddy ช่วยเรื่องอาหารและสุขภาพเท่านั้นนะ — ส่งรูปอาหารมาได้เลย! 🍽️"
 OFFTOPIC_EN = "NutriBuddy only covers food and health — send me a food photo! 🍽️"
+
+HISTORY_LIMIT_TH = "NutriBuddy เก็บประวัติอาหารได้แค่ 30 วันย้อนหลังนะ"
+HISTORY_LIMIT_EN = "NutriBuddy keeps meal history for the last 30 days only."
 
 GOAL_MAP = {
     "1": "lose_weight", "ลดน้ำหนัก": "lose_weight", "lose weight": "lose_weight",
@@ -110,6 +114,51 @@ def classify_off_topic(text: str) -> bool:
             f"Is this message related to food, nutrition, health, or eating habits? Reply YES or NO only.\n\nMessage: {text}"}]
     )
     return resp.content[0].text.strip().upper() == "NO"
+
+
+def detect_date_intent(text: str) -> str:
+    # PLAN:
+    # 1. Ask Haiku: is this a meal-history question? If yes, return YYYY-MM-DD (Bangkok).
+    # 2. Validate the returned date — if it parses OK, check 30-day cap.
+    # 3. Return "TOO_OLD" | "NO" | "YYYY-MM-DD"
+    today_bkk = datetime.now(BKK).date()
+    resp = claude.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=20,
+        messages=[{"role": "user", "content":
+            f"Today is {today_bkk} (Bangkok time). "
+            f"Is the user asking about their past meals? "
+            f"If yes, reply with only the date in YYYY-MM-DD format (resolve 'yesterday', 'last Monday', etc.). "
+            f"If asking about a range/week, use the earliest date in the range. "
+            f"If no meal-history question, reply: NO\n\nMessage: {text}"}]
+    )
+    result = resp.content[0].text.strip()
+    if result.upper() == "NO":
+        return "NO"
+    try:
+        asked_date = datetime.strptime(result, "%Y-%m-%d").date()
+        cutoff = today_bkk - timedelta(days=30)
+        if asked_date < cutoff:
+            return "TOO_OLD"
+        return result
+    except ValueError:
+        return "NO"
+
+
+def build_meal_history_context(meals: list, date_str: str) -> str:
+    # PLAN:
+    # 1. If no meals, return a "no meals logged" string for the date.
+    # 2. Group by meal_type, list dish names, return formatted string.
+    if not meals:
+        return f"(No meals logged for {date_str})"
+    by_type: dict = {}
+    for m in meals:
+        by_type.setdefault(m["meal_type"], []).append(m["description"])
+    parts = ", ".join(
+        f"{mtype.capitalize()}: {', '.join(dishes)}"
+        for mtype, dishes in by_type.items()
+    )
+    return f"Meal history for {date_str}: {parts}"
 
 
 def _reply(reply_token: str, text: str):
@@ -187,12 +236,40 @@ def handle_text(event):
         _reply(event.reply_token, msg)
         return
 
+    # Meal history intent detection
+    # PLAN:
+    # 1. Ask Haiku if user is asking about past meals → get date or NO/TOO_OLD
+    # 2. TOO_OLD → reply with 30-day limit message, stop
+    # 3. Valid date → fetch that day's meals and build context string
+    # 4. Always inject today's meals as extra context regardless
+    date_intent = detect_date_intent(text)
+    if date_intent == "TOO_OLD":
+        _reply(event.reply_token, HISTORY_LIMIT_TH if lang == "th" else HISTORY_LIMIT_EN)
+        return
+
+    meal_context_parts = []
+    if date_intent != "NO":
+        asked_dt = BKK.localize(datetime.strptime(date_intent, "%Y-%m-%d"))
+        history_meals = get_meals_by_date_range(user_id, asked_dt, asked_dt + timedelta(days=1))
+        meal_context_parts.append(build_meal_history_context(history_meals, date_intent))
+
+    # Always include today's meals for freshness
+    today_str = str(datetime.now(BKK).date())
+    if date_intent != today_str:  # avoid duplicate if user asked about today
+        today_meals = get_today_meals(user_id)
+        if today_meals:
+            meal_context_parts.append(build_meal_history_context(today_meals, today_str))
+
     # On-topic: Claude
     goal_label = GOAL_LABEL.get(user["goal"], "no specific goal")
+    system = SYSTEM_PROMPT.format(goal=goal_label)
+    if meal_context_parts:
+        system += "\n\nMEAL CONTEXT (use this when answering questions about what was eaten):\n" + "\n".join(meal_context_parts)
+
     resp = claude.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=300,
-        system=SYSTEM_PROMPT.format(goal=goal_label),
+        system=system,
         messages=[{"role": "user", "content": text}],
     )
     _reply(event.reply_token, resp.content[0].text)
