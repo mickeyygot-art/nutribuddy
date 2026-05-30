@@ -17,8 +17,8 @@ import pytz
 
 from database import (
     get_or_create_user, update_user_goal, update_user_language,
-    log_meal, get_today_meals, get_meals_by_date_range,
-    is_blocked, increment_off_topic, get_all_users,
+    log_meal, get_today_meals, get_meals_by_date_range, get_week_meals,
+    is_blocked, clear_block, increment_off_topic, get_all_users,
 )
 
 app = FastAPI()
@@ -54,6 +54,23 @@ OFFTOPIC_EN = "NutriBuddy only covers food and health — send me a food photo! 
 
 HISTORY_LIMIT_TH = "NutriBuddy เก็บประวัติอาหารได้แค่ 30 วันย้อนหลังนะ"
 HISTORY_LIMIT_EN = "NutriBuddy keeps meal history for the last 30 days only."
+
+TOO_LONG_TH = "ข้อความยาวเกินไปนิดนึงนะ ลองส่งสั้นๆ หรือส่งรูปอาหารมาได้เลย 🍽️"
+TOO_LONG_EN = "That message is a bit long! Try a shorter question or just send a food photo 🍽️"
+
+UNBLOCK_TH = "ยินดีต้อนรับกลับนะ! ส่งรูปอาหารมาได้เลย 🍽️"
+UNBLOCK_EN = "Welcome back! Send me a food photo anytime 🍽️"
+
+UNKNOWN_DISH_TH = "(ไม่แน่ใจชื่อเมนูนี้ — ช่วยบอกชื่อด้วยได้มั้ย?)"
+UNKNOWN_DISH_EN = "(Not sure what this dish is — could you tell me the name?)"
+
+WEEKLY_NO_MEALS_TH = "สัปดาห์นี้ยังไม่ได้ส่งรูปอาหารมาเลยนะ — สัปดาห์หน้าลองเริ่มด้วยมื้อเดียวก็ได้ 🍽️"
+WEEKLY_NO_MEALS_EN = "No meals logged this week — next week, try starting with just one photo 🍽️"
+
+UNBLOCK_KEYWORDS = {
+    "เริ่มใหม่", "ขอโทษ", "ยกเลิก", "unblock",
+    "start", "restart", "sorry",
+}
 
 GOAL_MAP = {
     "1": "lose_weight", "ลดน้ำหนัก": "lose_weight", "lose weight": "lose_weight",
@@ -92,6 +109,10 @@ CONTENT:
 - User's goal: {goal}"""
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
+
+# In-memory conversation history: {line_user_id: [{role, content}, ...]} max 10 entries
+conversation_history: dict[str, list] = {}
+
 
 def is_thai(text: str) -> bool:
     return any("฀" <= c <= "๿" for c in text)
@@ -134,6 +155,11 @@ def clean_for_line(text: str) -> str:
         text = text + ' ' + first_emoji
 
     return text.strip()
+
+
+def is_unblock_command(text: str) -> bool:
+    t = text.lower().strip()
+    return any(kw in t for kw in UNBLOCK_KEYWORDS)
 
 
 def classify_off_topic(text: str) -> bool:
@@ -240,8 +266,20 @@ def handle_text(event):
     if user["language"] != lang:
         update_user_language(line_user_id, lang)
 
+    # YOL-21: Input length guard — cap at 500 chars before any Claude call
+    if len(text) > 500:
+        _reply(event.reply_token, TOO_LONG_TH if lang == "th" else TOO_LONG_EN)
+        return
+
+    # YOL-20: Unblock command — check BEFORE blocked gate to allow escape
+    currently_blocked = is_blocked(user_id)
+    if is_unblock_command(text) and currently_blocked:
+        clear_block(user_id)
+        _reply(event.reply_token, UNBLOCK_TH if lang == "th" else UNBLOCK_EN)
+        return
+
     # Blocked?
-    if is_blocked(user_id):
+    if currently_blocked:
         _reply(event.reply_token, BLOCKED_TH if lang == "th" else BLOCKED_EN)
         return
 
@@ -267,12 +305,7 @@ def handle_text(event):
         _reply(event.reply_token, msg)
         return
 
-    # Meal history intent detection
-    # PLAN:
-    # 1. Ask Haiku if user is asking about past meals → get date or NO/TOO_OLD
-    # 2. TOO_OLD → reply with 30-day limit message, stop
-    # 3. Valid date → fetch that day's meals and build context string
-    # 4. Always inject today's meals as extra context regardless
+    # YOL-16: Meal history intent detection
     date_intent = detect_date_intent(text)
     if date_intent == "TOO_OLD":
         _reply(event.reply_token, HISTORY_LIMIT_TH if lang == "th" else HISTORY_LIMIT_EN)
@@ -284,26 +317,36 @@ def handle_text(event):
         history_meals = get_meals_by_date_range(user_id, asked_dt, asked_dt + timedelta(days=1))
         meal_context_parts.append(build_meal_history_context(history_meals, date_intent))
 
-    # Always include today's meals for freshness
     today_str = str(datetime.now(BKK).date())
-    if date_intent != today_str:  # avoid duplicate if user asked about today
+    if date_intent != today_str:
         today_meals = get_today_meals(user_id)
         if today_meals:
             meal_context_parts.append(build_meal_history_context(today_meals, today_str))
 
-    # On-topic: Claude
+    # On-topic: Claude with conversation history (YOL-19)
     goal_label = GOAL_LABEL.get(user["goal"], "no specific goal")
     system = SYSTEM_PROMPT.format(goal=goal_label)
     if meal_context_parts:
         system += "\n\nMEAL CONTEXT (use this when answering questions about what was eaten):\n" + "\n".join(meal_context_parts)
 
+    # YOL-19: Append user message and call Claude with full history
+    history = conversation_history.setdefault(line_user_id, [])
+    history.append({"role": "user", "content": text})
+
     resp = claude.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=300,
         system=system,
-        messages=[{"role": "user", "content": text}],
+        messages=history,
     )
-    _reply(event.reply_token, resp.content[0].text)
+    reply_text = resp.content[0].text
+
+    # YOL-19: Store assistant reply, trim history to last 10 entries (5 pairs)
+    history.append({"role": "assistant", "content": reply_text})
+    if len(history) > 10:
+        conversation_history[line_user_id] = history[-10:]
+
+    _reply(event.reply_token, reply_text)
 
 
 # ── IMAGE ─────────────────────────────────────────────────────────────────────
@@ -325,32 +368,52 @@ def handle_image(event):
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
     goal_label = GOAL_LABEL.get(user["goal"], "no specific goal")
 
-    # Single call: extract dish name + coaching response together
+    # YOL-23: Updated vision prompt — extract full variant name including cooking method + sides
+    vision_prompt = (
+        "What dish is this? Start your reply with 'DISH: [full dish name including cooking method and visible sides]' on the first line. "
+        "Examples: 'ข้าวมันไก่ทอด', 'ข้าวมันไก่ต้ม + ไข่ต้ม', 'กะเพราหมูสับไข่ดาว', 'Grilled salmon + steamed rice'. "
+        "Be specific about cooking method (ทอด/ต้ม/ย่าง/ผัด / fried/steamed/grilled/stir-fried) when visible. "
+        "Then a blank line, then your coaching response."
+    )
+
     resp = claude.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=300,
         system=SYSTEM_PROMPT.format(goal=goal_label),
         messages=[{"role": "user", "content": [
             {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64}},
-            {"type": "text", "text": "What dish is this? Start your reply with 'DISH: [dish name]' on the first line, then a blank line, then your coaching response."},
+            {"type": "text", "text": vision_prompt},
         ]}],
     )
 
     full_response = resp.content[0].text
     lines = full_response.strip().splitlines()
 
-    # Extract dish name for DB, coaching text for user
-    dish_name = "unknown dish"
+    # YOL-23: Extract full variant dish name; handle unknown gracefully
+    dish_name = None
     coaching_text = full_response
     if lines and lines[0].upper().startswith("DISH:"):
         dish_name = lines[0][5:].strip()
         coaching_text = "\n".join(lines[2:]).strip() if len(lines) > 2 else full_response
 
+    if not dish_name:
+        # YOL-23: Unknown dish — append nudge, skip DB logging
+        nudge = UNKNOWN_DISH_TH if lang == "th" else UNKNOWN_DISH_EN
+        coaching_text = coaching_text + "\n" + nudge
+    else:
+        try:
+            log_meal(user_id, dish_name)
+        except Exception as e:
+            print(f"Meal log error for {user_id}: {e}")
+
+    # YOL-19: Add photo + reply to conversation history
+    history = conversation_history.setdefault(line_user_id, [])
+    history.append({"role": "user", "content": "[sent a food photo]"})
+    history.append({"role": "assistant", "content": coaching_text})
+    if len(history) > 10:
+        conversation_history[line_user_id] = history[-10:]
+
     _reply(event.reply_token, coaching_text)
-    try:
-        log_meal(user_id, dish_name)  # Store only clean dish name, not full AI response
-    except Exception as e:
-        print(f"Meal log error for {user_id}: {e}")  # Non-fatal — user got reply, log fails silently
 
 
 # ── DAILY SUMMARY ─────────────────────────────────────────────────────────────
@@ -411,10 +474,65 @@ STRICT FORMATTING — LINE does not render markdown:
             print(f"Summary error for {user.get('line_user_id')}: {e}")
 
 
+# ── WEEKLY SUMMARY (Monday 08:00 Bangkok = Monday 01:00 UTC) ──────────────────
+
+def send_weekly_summaries():
+    # PLAN:
+    # 1. For each user fetch last 7 days of meals
+    # 2. If 0 meals → re-engagement message (no Claude call)
+    # 3. Otherwise count distinct days logged, find top dishes, build prompt
+    # 4. Push Claude-generated summary
+    for user in get_all_users():
+        try:
+            meals = get_week_meals(user["id"])
+            lang = user["language"]
+            line_user_id = user["line_user_id"]
+
+            if not meals:
+                msg = WEEKLY_NO_MEALS_TH if lang == "th" else WEEKLY_NO_MEALS_EN
+                _push(line_user_id, msg)
+                continue
+
+            # Count distinct days and most common dishes
+            from collections import Counter
+            days_with_meals = len({m["logged_at"][:10] for m in meals})
+            dish_counts = Counter(m["description"] for m in meals)
+            top_dishes = ", ".join(d for d, _ in dish_counts.most_common(3))
+            goal_label = GOAL_LABEL.get(user["goal"], "no specific goal")
+            lang_word = "Thai" if lang == "th" else "English"
+
+            prompt = f"""Weekly summary for a NutriBuddy user.
+Goal: {goal_label}
+Days logged this week: {days_with_meals}/7
+Most eaten dishes: {top_dishes}
+
+Write a 4-sentence weekly recap:
+1. Days logged — one warm sentence mentioning they logged {days_with_meals} out of 7 days
+2. Most common meals — one sentence naming the top dishes
+3. Goal note — one sentence on how this week connected to their goal
+4. Next week tip — one specific, practical suggestion for next week
+
+STRICT FORMATTING — LINE does not render markdown:
+- NEVER use **, *, __, _, #, or any markdown symbols
+- Plain text only, like an SMS message
+- Max 1 emoji total, at the end of a sentence only
+- Warm friend tone, reply in {lang_word}"""
+
+            resp = claude.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=250,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            _push(line_user_id, resp.content[0].text)
+        except Exception as e:
+            print(f"Weekly summary error for {user.get('line_user_id')}: {e}")
+
+
 # ── SCHEDULER (20:00 Bangkok = 13:00 UTC) ─────────────────────────────────────
 
 scheduler = BackgroundScheduler(timezone=pytz.utc)
 scheduler.add_job(send_daily_summaries, "cron", hour=13, minute=0)
+scheduler.add_job(send_weekly_summaries, "cron", day_of_week="mon", hour=1, minute=0)
 scheduler.start()
 
 
@@ -432,4 +550,14 @@ def trigger_summary(request: Request):
     if not expected or request.headers.get("X-Cron-Secret", "") != expected:
         raise HTTPException(status_code=403, detail="Forbidden")
     send_daily_summaries()
+    return {"status": "sent"}
+
+
+@app.post("/cron/weekly-summary")
+def trigger_weekly_summary(request: Request):
+    """Manual trigger for weekly summary — protected by CRON_SECRET header."""
+    expected = os.environ.get("CRON_SECRET", "")
+    if not expected or request.headers.get("X-Cron-Secret", "") != expected:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    send_weekly_summaries()
     return {"status": "sent"}

@@ -1,5 +1,26 @@
 # NutriBuddy — Development Guide
 
+## Agent Responsibilities
+
+**Product Agent (Cowork session)**
+* Product strategy, feature decisions, roadmap
+* Analyzing problems and proposing solutions
+* Creating and updating Linear issues
+* Does NOT write code directly
+
+**Developer Agent (Claude Code — nutribuddy/ folder)**
+* Reads Linear issues and implements them
+* Follows the planning steps below before every task
+* Writes code, runs tests, commits with issue reference
+* Does NOT make product decisions
+
+**Handoff process**
+* Product agent creates a Linear issue with full implementation plan
+* Developer agent picks it up, reads this file, implements, commits as `feat/fix: description (YOL-XX)`
+* Developer agent marks the Linear issue Done and leaves a brief comment on what was built
+
+---
+
 ## Planning Steps — Required Before Writing Any Code
 
 Every task from Linear must go through these steps before implementation starts. No exceptions, even for "small" changes.

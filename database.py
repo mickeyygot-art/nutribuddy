@@ -129,6 +129,13 @@ def is_blocked(user_id: str) -> bool:
     return False
 
 
+def clear_block(user_id: str):
+    """Reset off-topic count and remove block — called by unblock command."""
+    supabase.table("off_topic_log").update(
+        {"count": 0, "blocked_until": None}
+    ).eq("user_id", user_id).execute()
+
+
 def increment_off_topic(user_id: str) -> int:
     """Returns new count. If count reaches 3, sets 6hr block and resets count."""
     result = supabase.table("off_topic_log").select("*").eq("user_id", user_id).execute()
@@ -145,3 +152,26 @@ def increment_off_topic(user_id: str) -> int:
 
     supabase.table("off_topic_log").update(update).eq("user_id", user_id).execute()
     return count
+
+
+# ── WEEKLY MEALS ──────────────────────────────────────────────────────────────
+
+def get_week_meals(user_id: str) -> list:
+    # PLAN:
+    # 1. Compute Bangkok midnight 7 days ago → convert to UTC
+    # 2. Fetch all meals from that point to now, ordered by logged_at
+    week_start = (
+        datetime.now(BKK)
+        .replace(hour=0, minute=0, second=0, microsecond=0)
+        - timedelta(days=7)
+    ).astimezone(timezone.utc).isoformat()
+
+    return (
+        supabase.table("meals")
+        .select("*")
+        .eq("user_id", user_id)
+        .gte("logged_at", week_start)
+        .order("logged_at")
+        .execute()
+        .data
+    )

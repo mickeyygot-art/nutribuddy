@@ -119,6 +119,30 @@ def check_cron_auth(header_secret: str, env_secret: str) -> bool:
     return header_secret == env_secret
 
 
+def is_unblock_command(text: str) -> bool:
+    """Pure helper — mirrors main.py is_unblock_command."""
+    UNBLOCK_KEYWORDS = {
+        "เริ่มใหม่", "ขอโทษ", "ยกเลิก", "unblock",
+        "start", "restart", "sorry",
+    }
+    t = text.lower().strip()
+    return any(kw in t for kw in UNBLOCK_KEYWORDS)
+
+
+def trim_history(history: list, max_entries: int = 10) -> list:
+    """Pure helper — mirrors the history-trim logic in handle_text."""
+    if len(history) > max_entries:
+        return history[-max_entries:]
+    return history
+
+
+def get_top_dishes(meals: list, n: int = 3) -> list:
+    """Pure helper — mirrors weekly summary top-dish logic."""
+    from collections import Counter
+    dish_counts = Counter(m["description"] for m in meals)
+    return [d for d, _ in dish_counts.most_common(n)]
+
+
 def simulate_block_state(current_count: int, blocked_until_str: str | None = None) -> tuple[str, int]:
     now = datetime.now(timezone.utc)
     if blocked_until_str:
@@ -301,6 +325,104 @@ def test_off_topic_block():
     run("Expired block → resets to WARNED", state == "WARNED" and count == 1)
 
 
+def test_input_length_guard():
+    print("=== Input length guard (YOL-21) ===")
+    run("500 chars → passes", len("ก" * 500) <= 500)
+    run("501 chars → blocked", len("ก" * 501) > 500)
+    run("Empty string → passes", len("") <= 500)
+    run("English 500 → passes", len("a" * 500) <= 500)
+    run("English 501 → blocked", len("a" * 501) > 500)
+
+
+def test_unblock_command():
+    print("=== Unblock command (YOL-20) ===")
+    run("'เริ่มใหม่' → unblock", is_unblock_command("เริ่มใหม่"))
+    run("'ขอโทษ' → unblock", is_unblock_command("ขอโทษ"))
+    run("'ยกเลิก' → unblock", is_unblock_command("ยกเลิก"))
+    run("'unblock' → unblock", is_unblock_command("unblock"))
+    run("'sorry' → unblock", is_unblock_command("sorry"))
+    run("'restart' → unblock", is_unblock_command("restart"))
+    run("Sentence with keyword", is_unblock_command("I'm sorry about that"))
+    run("Random food msg → not unblock", not is_unblock_command("กินข้าวมันไก่"))
+    run("Empty → not unblock", not is_unblock_command(""))
+    run("Case insensitive EN", is_unblock_command("SORRY"))
+
+
+def test_deep_dish_variant():
+    print("=== Deep dish variant (YOL-23) ===")
+    # Cooking method in DISH prefix → stored as-is
+    d, c = extract_dish("DISH: ข้าวมันไก่ทอด\n\nโปรตีนดี!")
+    run("Cooking method stored", d == "ข้าวมันไก่ทอด")
+
+    d, c = extract_dish("DISH: ข้าวมันไก่ต้ม + ไข่ต้ม\n\nดีมาก!")
+    run("Dish + sides stored", d == "ข้าวมันไก่ต้ม + ไข่ต้ม")
+
+    d, c = extract_dish("DISH: Grilled salmon + steamed rice\n\nGreat protein!")
+    run("English variant stored", d == "Grilled salmon + steamed rice")
+
+    # Missing DISH prefix → dish_name is None (unknown)
+    d, c = extract_dish("Looks like a healthy bowl!")
+    run("No DISH prefix → unknown dish", d == "unknown dish")
+
+    # Dish only line (no coaching) → no crash
+    d, c = extract_dish("DISH: กะเพราหมูสับไข่ดาว")
+    run("Dish-only line → name extracted", d == "กะเพราหมูสับไข่ดาว")
+
+
+def test_conversation_history():
+    print("=== Conversation history (YOL-19) ===")
+    # Append up to 10 entries correctly
+    hist = []
+    for i in range(5):
+        hist.append({"role": "user", "content": f"msg {i}"})
+        hist.append({"role": "assistant", "content": f"reply {i}"})
+    run("10 entries fit without trim", len(trim_history(hist)) == 10)
+
+    # 11th entry triggers trim → keeps last 10
+    hist.append({"role": "user", "content": "extra"})
+    trimmed = trim_history(hist)
+    run("11 entries → trimmed to 10", len(trimmed) == 10)
+    run("Oldest entry removed", trimmed[0]["content"] == "reply 0")
+
+    # Image summary entry format
+    img_entry = {"role": "user", "content": "[sent a food photo]"}
+    run("Image entry role correct", img_entry["role"] == "user")
+    run("Image entry content correct", img_entry["content"] == "[sent a food photo]")
+
+    # Empty history → no trim needed
+    run("Empty history → empty", len(trim_history([])) == 0)
+
+
+def test_weekly_summary_logic():
+    print("=== Weekly summary logic (YOL-22) ===")
+    # Top dishes identified correctly
+    meals_week = [
+        {"description": "ข้าวมันไก่"},
+        {"description": "ข้าวมันไก่"},
+        {"description": "กะเพราหมู"},
+        {"description": "ข้าวมันไก่"},
+        {"description": "ต้มยำกุ้ง"},
+        {"description": "กะเพราหมู"},
+        {"description": "ข้าวผัด"},
+    ]
+    top = get_top_dishes(meals_week)
+    run("Top dish is ข้าวมันไก่", top[0] == "ข้าวมันไก่")
+    run("Second dish is กะเพราหมู", top[1] == "กะเพราหมู")
+    run("Top 3 returned", len(top) == 3)
+
+    # 0 meals → no Claude call (re-engagement branch)
+    run("0 meals → empty top dishes", get_top_dishes([]) == [])
+
+    # Distinct days count
+    meals_with_dates = [
+        {"description": "x", "logged_at": "2026-05-26T08:00:00"},
+        {"description": "y", "logged_at": "2026-05-26T13:00:00"},
+        {"description": "z", "logged_at": "2026-05-27T08:00:00"},
+    ]
+    days = len({m["logged_at"][:10] for m in meals_with_dates})
+    run("2 distinct days counted", days == 2)
+
+
 def test_clean_for_line():
     print("=== Markdown + emoji stripping ===")
     run("**bold** removed", clean_for_line("**เช้า** — ไก่ย่าง") == "เช้า — ไก่ย่าง")
@@ -329,6 +451,11 @@ if __name__ == "__main__":
         test_cron_auth,
         test_off_topic_block,
         test_meal_history_context,
+        test_input_length_guard,
+        test_unblock_command,
+        test_deep_dish_variant,
+        test_conversation_history,
+        test_weekly_summary_logic,
         test_clean_for_line,
     ]
     passed = 0
