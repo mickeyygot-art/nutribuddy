@@ -1,316 +1,144 @@
 # NutriBuddy — System Architecture
 
-**Owner:** Architect Agent
-**Last updated:** May 2026
-**Status:** MVP / Beta
+**Owner:** Architect Agent · **Status:** MVP / Beta · **Updated:** May 2026
 
-This document is maintained by the architect agent. Update it whenever infrastructure, data flow, or system boundaries change.
-
----
-
-## System Overview
-
-NutriBuddy is a LINE-native AI health coaching bot. Users interact entirely through LINE Messaging API — no separate app download required. The system processes food photos and text messages, provides nutritional coaching, logs meals, and sends proactive daily and weekly summaries.
+LINE-native AI health coaching bot. Users interact entirely through LINE — no app download. Processes food photos and text, coaches on nutrition, logs meals, sends daily/weekly summaries. Maintain this doc whenever infra, data flow, or boundaries change.
 
 ---
 
 ## System Diagram
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                        USER                             │
-│                    (LINE App)                           │
-└────────────────────────┬────────────────────────────────┘
-                         │ HTTPS
-                         ▼
-┌─────────────────────────────────────────────────────────┐
-│                LINE Messaging API                        │
-│         (Message routing, push notifications)           │
-│                    LINE CDN                             │
-│            (Image content delivery)                     │
-└────────────────────────┬────────────────────────────────┘
-                         │ POST /webhook
-                         ▼
-┌─────────────────────────────────────────────────────────┐
-│              Railway (Single Service)                    │
-│                                                         │
-│   FastAPI + Uvicorn (Python 3.12)                       │
-│   ├── POST /webhook    (LINE event dispatcher)          │
-│   ├── GET  /health     (health check)                   │
-│   ├── POST /cron/daily-summary   (manual trigger)       │
-│   ├── POST /cron/weekly-summary  (manual trigger)       │
-│   └── APScheduler (background, in-process)             │
-│       ├── Daily  13:00 UTC → send_daily_summaries()    │
-│       └── Weekly Mon 01:00 UTC → send_weekly_summaries()│
-│                                                         │
-│   In-memory state:                                      │
-│   └── conversation_history  {line_user_id: [msg, ...]} │
-│       (last 10 messages per user, resets on deploy)    │
-└──────────┬──────────────────────┬───────────────────────┘
-           │                      │
-           ▼                      ▼
-┌──────────────────┐   ┌─────────────────────┐
-│  Anthropic API   │   │   Supabase           │
-│                  │   │   (PostgreSQL)       │
-│  claude-sonnet-4-6   │                      │
-│  · text replies  │   │   users              │
-│  · vision        │   │   meals              │
-│  · daily summary │   │   off_topic_log      │
-│  · weekly summary│   │                      │
-│                  │   └─────────────────────┘
-│  claude-haiku-4-5│
-│  · off-topic     │
-│    classifier    │
-│  · meal report   │
-│    classifier    │
-│  · dish name     │
-│    extractor     │
-│  · date intent   │
-│    detector      │
-└──────────────────┘
+USER (LINE App)
+  │ HTTPS
+  ▼
+LINE Messaging API + CDN  (routing, push, image delivery)
+  │ POST /webhook
+  ▼
+Railway — single FastAPI + Uvicorn service (Python 3.12)
+  ├── POST /webhook              LINE event dispatcher
+  ├── GET  /health
+  ├── POST /cron/daily-summary   manual trigger (CRON_SECRET)
+  ├── POST /cron/weekly-summary  manual trigger (CRON_SECRET)
+  ├── APScheduler (in-process)
+  │     ├── daily  13:00 UTC      → send_daily_summaries()
+  │     └── weekly Mon 01:00 UTC  → send_weekly_summaries()
+  └── in-memory: conversation_history {line_user_id: [last 10 msgs]}  (resets on deploy)
+  │                                    │
+  ▼                                    ▼
+Anthropic API                     Supabase (PostgreSQL)
+  ├── claude-sonnet-4-6             users · meals
+  │   text / vision / summaries     off_topic_log · event_log
+  └── claude-haiku-4-5
+      classifiers + extractors
 ```
 
 ---
 
-## Data Flow Diagrams
+## Data Flows
 
-### Photo message flow
-```
-User sends photo
-→ LINE delivers POST /webhook
-→ Signature verified (X-Line-Signature / LINE_CHANNEL_SECRET)
-→ get_or_create_user() → Supabase
-→ is_blocked() → Supabase off_topic_log
-  → If blocked: reply BLOCKED message, return
-→ Download image bytes from LINE CDN (MessagingApiBlob)
-→ Base64 encode image
-→ Claude Sonnet vision call
-  → System: SYSTEM_PROMPT (goal-aware)
-  → User: image + structured vision_prompt
-  → Returns: "DISH: [full dish name]\n\n[coaching text]"
-→ Parse: extract dish_name from first line
-→ If dish_name found:
-  → log_meal(user_id, dish_name) → Supabase meals
-→ If dish_name not found:
-  → append UNKNOWN_DISH nudge to coaching_text, skip DB write
-→ Append to in-memory conversation_history (trim to 10)
-→ _reply(reply_token, coaching_text) → LINE Messaging API
-```
+**Photo:** webhook → verify signature → get_or_create_user → is_blocked? → download image (LINE CDN) → base64 → Sonnet vision (`DISH: [name]\n\n[coaching]`) → parse dish → log_meal (or UNKNOWN nudge if no dish) → append history → reply.
 
-### Text message flow
-```
-User sends text
-→ LINE delivers POST /webhook
-→ Signature verified
-→ get_or_create_user() → Supabase
-→ Language detection (Thai char range check)
-  → update_user_language() if changed → Supabase
-→ Input length guard (>500 chars → reply TOO_LONG, return)
-→ is_blocked() → Supabase off_topic_log
-→ is_unblock_command() check
-  → If unblock keyword AND currently blocked:
-    → clear_block() → Supabase, reply UNBLOCK, return
-→ If blocked: reply BLOCKED, return
-→ detect_goal() keyword match
-  → If goal found: update_user_goal() → Supabase, reply confirmation, return
-→ is_conversational() check (≤10 chars OR in whitelist)
-  → If conversational: skip off-topic classifier
-→ If not conversational: classify_off_topic() → Claude Haiku
-  → If off-topic:
-    → increment_off_topic() → Supabase
-    → count=1 → reply OFFTOPIC warning
-    → count=2 → reply WARN_2 (last warning)
-    → count≥3 → set 6hr block, reply BLOCKED, return
-→ classify_meal_report() → Claude Haiku
-  → If MEAL: extract_dish_from_text() → Claude Haiku
-    → log_meal(user_id, dish_name) → Supabase
-→ detect_date_intent() → Claude Haiku
-  → If TOO_OLD: reply HISTORY_LIMIT, return
-  → If date found: get_meals_by_date_range() → Supabase
-→ get_today_meals() → Supabase (always, for context)
-→ Build system prompt (goal + meal context)
-→ Append user message to in-memory conversation_history
-→ Claude Sonnet call with full history
-→ Append assistant reply to conversation_history (trim to 10)
-→ _reply(reply_token, clean_for_line(reply_text)) → LINE
-```
+**Text:** webhook → verify → get_or_create_user → lang detect → >500 chars? TOO_LONG → is_blocked / unblock keyword → detect_goal → is_conversational? skip classifier → classify_off_topic (Haiku) → 1/2/3 strikes (warn → warn → 6hr block) → classify_meal_report + extract_dish (Haiku) → log_meal → detect_date_intent (Haiku) → fetch history → build goal+meal prompt → Sonnet w/ history → clean_for_line → reply.
 
-### Follow event (onboarding) flow
-```
-User follows bot
-→ LINE delivers POST /webhook (FollowEvent)
-→ get_or_create_user(line_user_id) → Supabase
-  → Insert with defaults: goal=no_goal, language=th
-→ _reply(reply_token, ONBOARDING_MSG_1)  ← goal selection prompt
-→ sleep(1)
-→ _push(line_user_id, ONBOARDING_MSG_2)  ← features overview
-```
+**Follow (onboarding):** webhook → get_or_create_user (defaults goal=no_goal, language=th) → reply ONBOARDING_MSG_1 → sleep(1) → push ONBOARDING_MSG_2.
 
-### Daily summary flow (20:00 Bangkok = 13:00 UTC)
-```
-APScheduler fires send_daily_summaries()
-→ get_all_users() → Supabase (all rows — see scaling note)
-→ For each user:
-  → get_today_meals(user_id) → Supabase
-  → If no meals:
-    → _push(line_user_id, fixed nudge message)
-    → continue
-  → Group meals by meal_type
-  → Build structured prompt (goal-aware, 4-sentence template)
-    → has_dinner flag modifies template:
-       · With dinner:    [what ate] [goal progress] [tomorrow tip]
-       · Without dinner: [what ate] [goal progress] [dinner wish] [tomorrow tip]
-  → Claude Sonnet call (max_tokens=250)
-  → _push(line_user_id, summary)
-```
+**Daily summary (20:00 BKK = 13:00 UTC):** get_all_users → per user: get_today_meals → no meals? push nudge : group by type → goal-aware 4-part prompt (has_dinner flag) → Sonnet (250 tok) → push.
 
-### Weekly summary flow (Monday 08:00 Bangkok = Monday 01:00 UTC)
-```
-APScheduler fires send_weekly_summaries()
-→ get_all_users() → Supabase
-→ For each user:
-  → get_week_meals(user_id) → Supabase (last 7 days)
-  → If no meals:
-    → _push(line_user_id, WEEKLY_NO_MEALS fixed message)
-    → continue
-  → Compute days_with_meals, top 3 dishes by frequency
-  → days_with_meals ≤ 2 → inject warm low-log prefix
-  → Select goal-specific guidance (lose_weight/eat_clean/build_muscle/no_goal)
-  → Build 4-part structured prompt
-  → Claude Sonnet call (max_tokens=280)
-  → _push(line_user_id, weekly_summary)
-```
+**Weekly summary (Mon 08:00 BKK = Mon 01:00 UTC):** get_all_users → per user: get_week_meals → no meals? push fixed : compute days_logged + top-3 dishes → ≤2 days inject warm prefix → goal-specific guidance → 4-part prompt → Sonnet (280 tok) → push.
 
 ---
 
 ## Database Entity Diagram
 
 ```
-users
-├── id              UUID PK (gen_random_uuid)
-├── line_user_id    TEXT UNIQUE NOT NULL   ← LINE's stable user identifier
-├── goal            TEXT DEFAULT 'no_goal' ← lose_weight|eat_clean|build_muscle|no_goal
-├── language        TEXT DEFAULT 'th'      ← th|en (auto-detected per message)
-├── created_at      TIMESTAMPTZ DEFAULT NOW()
-└── last_active_at  TIMESTAMPTZ            ← updated on every message received (YOL-35)
-
-meals
-├── id              UUID PK
-├── user_id         UUID FK → users.id ON DELETE CASCADE
-├── description     TEXT  ← dish name (max 200 chars)
-├── meal_type       TEXT  ← breakfast|lunch|dinner|snack|late_snack (time-derived)
-├── source          TEXT DEFAULT 'photo'   ← photo|text (YOL-35)
-└── logged_at       TIMESTAMPTZ DEFAULT NOW()
-
-off_topic_log
-├── id              UUID PK
-├── user_id         UUID FK → users.id ON DELETE CASCADE UNIQUE
-├── count           INTEGER DEFAULT 0  ← resets to 0 after block triggered
-├── blocked_until   TIMESTAMPTZ        ← NULL = not blocked
-└── updated_at      TIMESTAMPTZ DEFAULT NOW()
-
-event_log                                  ← engagement audit trail (YOL-35)
-├── id              UUID PK
-├── user_id         UUID FK → users.id ON DELETE CASCADE
-├── event_type      TEXT NOT NULL  ← daily_summary_sent|weekly_summary_sent|
-│                                     block_triggered|dashboard_requested|unblock
-└── created_at      TIMESTAMPTZ DEFAULT NOW()
+users                                    meals
+├── id              UUID PK              ├── id          UUID PK
+├── line_user_id    TEXT UNIQUE          ├── user_id     FK → users.id CASCADE
+├── goal            TEXT                 ├── description TEXT (≤200 chars)
+│   lose_weight|eat_clean|               ├── meal_type   breakfast|lunch|dinner|
+│   build_muscle|no_goal                 │               snack|late_snack (time-derived)
+├── language        th|en                ├── source      photo|text
+├── created_at      TIMESTAMPTZ          └── logged_at   TIMESTAMPTZ
+└── last_active_at  TIMESTAMPTZ
+                                         event_log
+off_topic_log                            ├── id          UUID PK
+├── id              UUID PK              ├── user_id     FK → users.id CASCADE
+├── user_id         FK UNIQUE CASCADE    ├── event_type  daily_summary_sent|
+├── count           INTEGER (resets@3)   │   weekly_summary_sent|block_triggered|
+├── blocked_until   TIMESTAMPTZ (NULL=ok)│   dashboard_requested|unblock
+└── updated_at      TIMESTAMPTZ          └── created_at  TIMESTAMPTZ
 ```
 
-**Relationships:**
-```
-users ──< meals           (one user → many meal records)
-users ──| off_topic_log   (one user → zero or one off-topic record)
-users ──< event_log       (one user → many event records)
-```
+Relationships: `users ──< meals` · `users ──| off_topic_log` · `users ──< event_log`
 
 ---
 
-## Claude API Usage Map
+## Claude API Usage
 
-| Trigger | Model | Max tokens | Purpose |
+| Trigger | Model | Tokens | Purpose |
 |---|---|---|---|
-| Text message | claude-haiku-4-5-20251001 | 5 | Off-topic classification (YES/NO) |
-| Text message | claude-haiku-4-5-20251001 | 5 | Meal report classification (MEAL/NOT) |
-| Text message | claude-haiku-4-5-20251001 | 30 | Dish name extraction |
-| Text message | claude-haiku-4-5-20251001 | 20 | Date intent detection (YYYY-MM-DD/NO) |
-| Text message | claude-sonnet-4-6 | 300 | Conversational reply |
-| Photo message | claude-sonnet-4-6 | 300 | Vision + coaching (DISH: extraction) |
-| Daily summary | claude-sonnet-4-6 | 250 | Per-user daily summary |
-| Weekly summary | claude-sonnet-4-6 | 280 | Per-user weekly summary |
+| Text | haiku-4-5 | 5 | Off-topic classify (YES/NO) |
+| Text | haiku-4-5 | 5 | Meal report classify (MEAL/NOT) |
+| Text | haiku-4-5 | 30 | Dish name extract |
+| Text | haiku-4-5 | 20 | Date intent detect |
+| Text | sonnet-4-6 | 300 | Conversational reply |
+| Photo | sonnet-4-6 | 300 | Vision + coaching |
+| Daily | sonnet-4-6 | 250 | Per-user daily summary |
+| Weekly | sonnet-4-6 | 280 | Per-user weekly summary |
 
-**Cost estimate (per active user per day):**
-- Text message: up to 4 Haiku calls + 1 Sonnet call
-- Photo message: 1 Sonnet call
-- Daily summary: 1 Sonnet call (if meals logged)
-- Weekly summary: 1 Sonnet call / 7 days = ~0.14 Sonnet calls/day
+Per active user/day: text ≈ up to 4 Haiku + 1 Sonnet; photo = 1 Sonnet; daily = 1 Sonnet; weekly ≈ 0.14 Sonnet.
 
 ---
 
-## Infrastructure
+## Infrastructure & Security
 
-| Component | Service | Tier | Notes |
-|---|---|---|---|
-| Application server | Railway | Free/Hobby | Auto-deploy from GitHub main |
-| Database | Supabase | Free | 500MB limit |
-| AI API | Anthropic | Pay-per-use | Budget limit set in console |
-| Messaging | LINE Messaging API | Free (500 push/mo) | Reply tokens unlimited |
-| Scheduler | APScheduler (in-process) | — | Runs inside Railway service |
+| Component | Service | Tier |
+|---|---|---|
+| App server | Railway | Free/Hobby — auto-deploy from `main` |
+| Database | Supabase | Free — 500MB |
+| AI | Anthropic | Pay-per-use, console budget cap |
+| Messaging | LINE | Free — 500 push/mo, replies unlimited |
+| Scheduler | APScheduler | In-process |
 
----
-
-## Security Boundaries
-
-| Boundary | Mechanism |
-|---|---|
-| LINE webhook authenticity | X-Line-Signature HMAC-SHA256 verified on every POST /webhook |
-| Manual cron trigger | X-Cron-Secret header checked against CRON_SECRET env var |
-| Database access | service_role key, server-side only — never exposed to clients |
-| Secrets | All in Railway environment variables — never in code or git |
-| User identity | LINE user ID only — no PII (name, phone, email) stored |
+- LINE webhook: X-Line-Signature HMAC-SHA256 verified on every POST.
+- `/cron/*`: X-Cron-Secret checked against `CRON_SECRET`.
+- DB: service_role key, server-side only.
+- Secrets: Railway env vars only — never in code/git.
+- User identity: LINE user ID only — no PII stored.
 
 ---
 
-## Known Limitations & Technical Debt
+## Known Limitations
 
 | Issue | Impact | Fix when |
 |---|---|---|
-| APScheduler in-process | Summary fails silently if process restarts at 20:00 or 08:00 Monday | >100 users |
-| `get_all_users()` fetches all rows at once | Memory spike at scale | >500 users |
-| Conversation history in-memory | Resets on every deploy; users lose context | When users complain |
-| No image size validation | Memory spike on large image uploads | Before public launch |
-| No structured logging / error tracking | Hard to diagnose prod failures | Soon |
-| Single Railway service | No horizontal scaling | >1000 concurrent users |
+| APScheduler in-process | Summaries fail silently if process restarts at trigger time | >100 users |
+| `get_all_users()` fetches all rows | Memory spike | >500 users |
+| Conversation history in-memory | Resets on deploy | When users complain |
+| No image size validation | Memory spike on large uploads | Before public launch |
+| No structured logging | Hard to diagnose prod failures | Soon |
+| Single Railway service | No horizontal scaling | >1000 users |
 
 ---
 
 ## Scaling Roadmap
 
-**0–200 users:** No infrastructure changes. Monitor Supabase storage and Railway memory.
-
-**200–1000 users:**
-- Paginate `get_all_users()` (`.range(0, 99)`) in summary loops
-- Move APScheduler to Railway cron service (separate service, survives restarts)
-- Redis for conversation history (survives deploys, shared across instances)
-- Upgrade LINE plan if push message volume exceeds 500/month
-
-**1000+ users:**
-- Separate Railway services: API server + scheduler worker
-- Queue webhook processing (Railway Redis or managed queue)
-- Database indexes on `meals.user_id + logged_at`, `off_topic_log.user_id`
-- Read replicas for analytics queries (event_log already in place)
+**0–200:** No changes. Monitor Supabase storage + Railway memory.
+**200–1000:** Paginate `get_all_users()`; move scheduler to Railway cron service; Redis for conversation history; upgrade LINE plan if push >500/mo.
+**1000+:** Split API + scheduler services; queue webhook processing; index `meals(user_id, logged_at)` + `off_topic_log(user_id)`; read replicas for analytics (event_log already in place).
 
 ---
 
 ## Decision Log
 
-| Decision | Rationale | Date |
-|---|---|---|
-| Railway over AWS/GCP | Zero DevOps for MVP, auto-deploy from GitHub | May 2026 |
-| Supabase over self-hosted PostgreSQL | Managed DB, free tier sufficient for beta | May 2026 |
-| APScheduler in-process over Railway cron | Simpler for MVP, acceptable risk at beta scale | May 2026 |
-| Claude Haiku for all classifiers | Cost — classification requires max 5–30 tokens, not Sonnet quality | May 2026 |
-| In-memory conversation history | No DB overhead; reset on deploy acceptable for MVP | May 2026 |
-| Single Railway service | Sufficient for <200 users, simplest deployment path | May 2026 |
-| Dish name stored, not nutritional data | Nutrition estimates from LLM are unreliable; store facts only | May 2026 |
-| meal_type inferred from clock time | No user input needed; close enough for coaching context | May 2026 |
+| Decision | Rationale |
+|---|---|
+| Railway over AWS/GCP | Zero DevOps, auto-deploy from GitHub |
+| Supabase over self-hosted PG | Managed, free tier sufficient for beta |
+| APScheduler in-process | Simpler for MVP, acceptable beta risk |
+| Haiku for all classifiers | Cost — classification needs 5–30 tokens |
+| In-memory conversation history | No DB overhead; deploy reset acceptable |
+| Single Railway service | Sufficient <200 users, simplest path |
+| Store dish name, not nutrition data | LLM nutrition estimates unreliable |
+| meal_type from clock time | No user input; good enough for coaching |
