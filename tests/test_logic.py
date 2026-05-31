@@ -17,15 +17,18 @@ def is_thai(text: str) -> bool:
 
 
 def detect_goal(text: str) -> str | None:
-    GOAL_MAP = {
-        "1": "lose_weight",    "ลดน้ำหนัก": "lose_weight",      "lose weight": "lose_weight",
-        "2": "eat_clean",      "กินสะอาด": "eat_clean",          "eat clean": "eat_clean",
-                               "กินอาหารคลีน": "eat_clean",      "อาหารคลีน": "eat_clean",
-        "3": "build_muscle",   "เพิ่มกล้าม": "build_muscle",     "build muscle": "build_muscle",
-        "4": "no_goal",        "ยังไม่มี": "no_goal",            "no goal": "no_goal",
+    GOAL_DIGITS = {"1": "lose_weight", "2": "eat_clean", "3": "build_muscle", "4": "no_goal"}
+    GOAL_PHRASES = {
+        "ลดน้ำหนัก": "lose_weight",   "lose weight": "lose_weight",
+        "กินสะอาด": "eat_clean",       "eat clean": "eat_clean",
+        "กินอาหารคลีน": "eat_clean",   "อาหารคลีน": "eat_clean",
+        "เพิ่มกล้าม": "build_muscle",  "build muscle": "build_muscle",
+        "ยังไม่มีเป้าหมาย": "no_goal", "no goal": "no_goal",
     }
     t = text.lower().strip()
-    for key, goal in GOAL_MAP.items():
+    if t in GOAL_DIGITS:
+        return GOAL_DIGITS[t]
+    for key, goal in GOAL_PHRASES.items():
         if key in t:
             return goal
     return None
@@ -207,6 +210,11 @@ def test_goal_detection():
     run("English goal change", detect_goal("change to eat clean") == "eat_clean")
     run("New wording กินอาหารคลีน → eat_clean", detect_goal("กินอาหารคลีนมากขึ้น") == "eat_clean")
     run("New wording อาหารคลีน → eat_clean", detect_goal("อยากกินอาหารคลีน") == "eat_clean")
+    # Regression: bare digits must NOT match as substrings (lead-dev review fix)
+    run("'กินข้าว 2 จาน' → None (not eat_clean)", detect_goal("กินข้าว 2 จาน") is None)
+    run("'ate 1 plate' → None (not lose_weight)", detect_goal("ate 1 plate") is None)
+    run("Standalone '2' → eat_clean", detect_goal("2") == "eat_clean")
+    run("'  3  ' trimmed → build_muscle", detect_goal("  3  ") == "build_muscle")
 
 
 def test_dish_extraction():
@@ -586,6 +594,106 @@ def test_multi_meal_extraction():
     run("Source 'text' constant", "text" == "text")
 
 
+def parse_triage_json(raw: str) -> dict:
+    """Pure mirror of main.parse_triage_json."""
+    import json
+    SAFE = {"on_topic": True, "meals": [], "history_date": None}
+    if not raw:
+        return dict(SAFE)
+    s = raw.strip()
+    if s.startswith("```"):
+        s = s.strip("`")
+        if s[:4].lower() == "json":
+            s = s[4:]
+    start, end = s.find("{"), s.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        return dict(SAFE)
+    try:
+        data = json.loads(s[start:end + 1])
+    except (json.JSONDecodeError, ValueError):
+        return dict(SAFE)
+    if not isinstance(data, dict):
+        return dict(SAFE)
+    return {
+        "on_topic": bool(data.get("on_topic", True)),
+        "meals": data.get("meals") if isinstance(data.get("meals"), list) else [],
+        "history_date": data.get("history_date") or None,
+    }
+
+
+def cap_history_date(date_str, today):
+    """Pure mirror of main.cap_history_date."""
+    from datetime import datetime, timedelta
+    if not date_str:
+        return None
+    try:
+        asked = datetime.strptime(str(date_str), "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return None
+    if asked < today - timedelta(days=30):
+        return "TOO_OLD"
+    return str(date_str)
+
+
+def commit_history(history: list, user_text: str, reply: str) -> list:
+    """Pure mirror of the transactional history commit in handle_text."""
+    history = list(history)
+    history.append({"role": "user", "content": user_text})
+    history.append({"role": "assistant", "content": reply})
+    if len(history) > 10:
+        history = history[-10:]
+    return history
+
+
+def test_triage_parsing():
+    print("=== Triage JSON parsing (lead-dev refactor) ===")
+    # Clean JSON
+    r = parse_triage_json('{"on_topic": true, "meals": [{"dish":"ข้าวมันไก่","meal_type":"breakfast"}], "history_date": null}')
+    run("Clean JSON → on_topic", r["on_topic"] is True)
+    run("Clean JSON → 1 meal", len(r["meals"]) == 1)
+    run("Clean JSON → no history", r["history_date"] is None)
+    # Fenced JSON
+    r = parse_triage_json('```json\n{"on_topic": false, "meals": [], "history_date": "2026-05-20"}\n```')
+    run("Fenced JSON → off topic", r["on_topic"] is False)
+    run("Fenced JSON → history date", r["history_date"] == "2026-05-20")
+    # Prose-wrapped JSON
+    r = parse_triage_json('Here is the result: {"on_topic": true, "meals": []} hope it helps')
+    run("Prose-wrapped → parsed", r["on_topic"] is True)
+    # Garbage → safe default (on_topic so user never wrongly blocked)
+    r = parse_triage_json("totally not json")
+    run("Garbage → safe on_topic", r["on_topic"] is True and r["meals"] == [])
+    # Empty → safe default
+    run("Empty → safe default", parse_triage_json("")["on_topic"] is True)
+    # meals not a list → coerced to []
+    r = parse_triage_json('{"on_topic": true, "meals": "oops"}')
+    run("Bad meals type → []", r["meals"] == [])
+
+
+def test_cap_history_date():
+    print("=== History date cap (lead-dev refactor) ===")
+    today = datetime.now(BKK).date()
+    run("None → None", cap_history_date(None, today) is None)
+    run("Today → today", cap_history_date(str(today), today) == str(today))
+    run("Yesterday → ok", cap_history_date(str(today - timedelta(days=1)), today) == str(today - timedelta(days=1)))
+    run("30 days → ok", cap_history_date(str(today - timedelta(days=30)), today) == str(today - timedelta(days=30)))
+    run("31 days → TOO_OLD", cap_history_date(str(today - timedelta(days=31)), today) == "TOO_OLD")
+    run("Malformed → None", cap_history_date("not-a-date", today) is None)
+
+
+def test_transactional_history():
+    print("=== Transactional history commit (lead-dev fix) ===")
+    h = []
+    h = commit_history(h, "hi", "hello")
+    run("First turn → 2 entries", len(h) == 2)
+    run("Alternation user→assistant", h[0]["role"] == "user" and h[1]["role"] == "assistant")
+    # Fill past 10 → trims oldest, alternation preserved
+    for i in range(6):
+        h = commit_history(h, f"u{i}", f"a{i}")
+    run("Trimmed to 10", len(h) == 10)
+    run("Starts with user after trim", h[0]["role"] == "user")
+    run("Ends with assistant", h[-1]["role"] == "assistant")
+
+
 def test_conversational_whitelist():
     print("=== Conversational whitelist (YOL-25) ===")
     # Whitelist items → skip classifier
@@ -656,6 +764,9 @@ if __name__ == "__main__":
         test_meal_keyword_detection,
         test_dashboard_detection,
         test_multi_meal_extraction,
+        test_triage_parsing,
+        test_cap_history_date,
+        test_transactional_history,
         test_conversational_whitelist,
         test_meal_report_detection,
         test_clean_for_line,

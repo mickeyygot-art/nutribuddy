@@ -2,7 +2,6 @@ import os
 from datetime import datetime, timezone, timedelta
 from supabase import create_client, Client
 import pytz
-from typing import Optional
 
 supabase: Client = create_client(
     os.environ["SUPABASE_URL"].strip(),

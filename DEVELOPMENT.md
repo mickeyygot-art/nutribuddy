@@ -71,7 +71,7 @@ def trigger_summary(request: Request):
 
 ## API Usage Limits
 
-**Anthropic:** text = up to 4 Haiku + 1 Sonnet; image = 1 Sonnet; daily/weekly summary = 1 Sonnet per active user. Set a hard spending limit (recommend $20/mo during beta).
+**Anthropic:** text = 1 Haiku (single triage call: off-topic + meal extraction + history-date) + 1 Sonnet — short/conversational acks skip the Haiku entirely; image = 1 Sonnet; daily/weekly summary = 1 Sonnet per active user. Set a hard spending limit (recommend $20/mo during beta).
 **LINE:** free tier = 500 push/mo (summaries count; replies unlimited). Upgrade before user count > ~150.
 **Supabase:** free tier = 500MB DB, 2GB bandwidth. Monitor in Reports.
 

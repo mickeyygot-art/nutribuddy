@@ -108,12 +108,19 @@ DASHBOARD_KEYWORDS = {
 NO_MEALS_DASHBOARD_TH = "ยังไม่มีข้อมูลอาหารใน 7 วันที่ผ่านมาเลยนะ ลองส่งรูปอาหารมาให้ดูได้เลย 🍽️"
 NO_MEALS_DASHBOARD_EN = "No meals logged in the last 7 days yet — try sending a food photo! 🍽️"
 
-GOAL_MAP = {
-    "1": "lose_weight",    "ลดน้ำหนัก": "lose_weight",      "lose weight": "lose_weight",
-    "2": "eat_clean",      "กินสะอาด": "eat_clean",          "eat clean": "eat_clean",
-                           "กินอาหารคลีน": "eat_clean",      "อาหารคลีน": "eat_clean",
-    "3": "build_muscle",   "เพิ่มกล้าม": "build_muscle",     "build muscle": "build_muscle",
-    "4": "no_goal",        "ยังไม่มี": "no_goal",            "no goal": "no_goal",
+# Bare digits only match when the whole message IS that digit (onboarding reply).
+# Matching them as substrings silently changed goals on messages like "กินข้าว 2 จาน".
+GOAL_DIGITS = {
+    "1": "lose_weight", "2": "eat_clean", "3": "build_muscle", "4": "no_goal",
+}
+
+# Phrase keys match as substrings (intentional — "อยากลดน้ำหนัก" should work).
+GOAL_PHRASES = {
+    "ลดน้ำหนัก": "lose_weight",   "lose weight": "lose_weight",
+    "กินสะอาด": "eat_clean",       "eat clean": "eat_clean",
+    "กินอาหารคลีน": "eat_clean",   "อาหารคลีน": "eat_clean",
+    "เพิ่มกล้าม": "build_muscle",  "build muscle": "build_muscle",
+    "ยังไม่มีเป้าหมาย": "no_goal", "no goal": "no_goal",
 }
 
 GOAL_LABEL = {
@@ -162,7 +169,9 @@ def is_thai(text: str) -> bool:
 
 def detect_goal(text: str) -> str | None:
     t = text.lower().strip()
-    for key, goal in GOAL_MAP.items():
+    if t in GOAL_DIGITS:            # exact standalone digit (onboarding reply)
+        return GOAL_DIGITS[t]
+    for key, goal in GOAL_PHRASES.items():
         if key in t:
             return goal
     return None
@@ -247,77 +256,69 @@ def is_conversational(text: str) -> bool:
     return t.lower() in CONVERSATIONAL_WHITELIST
 
 
-def classify_meal_report(text: str) -> bool:
-    """YOL-24: Returns True if the message is reporting a meal the user ate."""
-    resp = claude.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=5,
-        messages=[{"role": "user", "content":
-            f"Is this message reporting a meal the user just ate or ate earlier today? Reply MEAL or NOT only.\n"
-            f"MEAL examples: 'กินข้าวมันไก่มาเมื่อเช้า', 'just had pad thai for lunch', 'เที่ยงกินกะเพรา'\n"
-            f"NOT examples: 'is pad thai healthy?', 'what should I eat tonight?', 'ขอบคุณ'\n\n"
-            f"Message: {text}"}]
-    )
-    return resp.content[0].text.strip().upper() == "MEAL"
+def parse_triage_json(raw: str) -> dict:
+    """Parse the triage model output robustly (handles ```json fences / stray prose).
 
-
-def extract_meals_from_text(text: str) -> list:
-    """YOL-32: Extract all meals from a meal report. Returns [{dish, meal_type}, ...]."""
+    Falls back to a safe default (on-topic, no meals, no history) so a bad parse
+    never blocks a legitimate user — worst case they just get a normal reply.
+    """
     import json
-    resp = claude.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=200,
-        messages=[{"role": "user", "content":
-            f"Extract all meals mentioned in this message. Return as JSON array only, no explanation.\n"
-            f"Format: [{{\"dish\": \"dish name\", \"meal_type\": \"breakfast|lunch|dinner|snack|late_snack\"}}]\n"
-            f"If meal type not mentioned, omit meal_type key.\n\n"
-            f"Message: {text}"}]
-    )
+    SAFE = {"on_topic": True, "meals": [], "history_date": None}
+    if not raw:
+        return dict(SAFE)
+    s = raw.strip()
+    if s.startswith("```"):
+        s = s.strip("`")
+        if s[:4].lower() == "json":
+            s = s[4:]
+    start, end = s.find("{"), s.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        return dict(SAFE)
     try:
-        result = json.loads(resp.content[0].text.strip())
-        return result if isinstance(result, list) else []
+        data = json.loads(s[start:end + 1])
     except (json.JSONDecodeError, ValueError):
-        return []
+        return dict(SAFE)
+    if not isinstance(data, dict):
+        return dict(SAFE)
+    return {
+        "on_topic": bool(data.get("on_topic", True)),
+        "meals": data.get("meals") if isinstance(data.get("meals"), list) else [],
+        "history_date": data.get("history_date") or None,
+    }
 
 
-def classify_off_topic(text: str) -> bool:
-    """Returns True if message is NOT related to food/health."""
-    resp = claude.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=5,
-        messages=[{"role": "user", "content":
-            f"Is this message related to food, nutrition, health, or eating habits? Reply YES or NO only.\n\nMessage: {text}"}]
-    )
-    return resp.content[0].text.strip().upper() == "NO"
+def cap_history_date(date_str, today):
+    """30-day window guard. Returns 'TOO_OLD' | 'YYYY-MM-DD' | None."""
+    if not date_str:
+        return None
+    try:
+        asked = datetime.strptime(str(date_str), "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return None
+    if asked < today - timedelta(days=30):
+        return "TOO_OLD"
+    return str(date_str)
 
 
-def detect_date_intent(text: str) -> str:
-    # PLAN:
-    # 1. Ask Haiku: is this a meal-history question? If yes, return YYYY-MM-DD (Bangkok).
-    # 2. Validate the returned date — if it parses OK, check 30-day cap.
-    # 3. Return "TOO_OLD" | "NO" | "YYYY-MM-DD"
+def triage_message(text: str) -> dict:
+    """Single Haiku call replacing 4 separate classifiers (off-topic, meal report,
+    meal extraction, date intent). Returns:
+        {on_topic: bool, meals: [{dish, meal_type}], history_date: 'YYYY-MM-DD'|None}
+    """
     today_bkk = datetime.now(BKK).date()
     resp = claude.messages.create(
         model="claude-haiku-4-5-20251001",
-        max_tokens=20,
+        max_tokens=250,
         messages=[{"role": "user", "content":
-            f"Today is {today_bkk} (Bangkok time). "
-            f"Is the user asking about their past meals? "
-            f"If yes, reply with only the date in YYYY-MM-DD format (resolve 'yesterday', 'last Monday', etc.). "
-            f"If asking about a range/week, use the earliest date in the range. "
-            f"If no meal-history question, reply: NO\n\nMessage: {text}"}]
+            f"You triage messages for a Thai food/health chatbot. Today is {today_bkk} (Bangkok).\n"
+            f"Return ONLY a JSON object, no other text:\n"
+            f'{{"on_topic": true/false, "meals": [{{"dish": "name", "meal_type": "breakfast|lunch|dinner|snack|late_snack|null"}}], "history_date": "YYYY-MM-DD" or null}}\n'
+            f"- on_topic: is it about food, nutrition, health, or eating? (greetings/acknowledgements count as on_topic)\n"
+            f"- meals: dishes the user reports having EATEN. Empty list if it's a question or no meal mentioned. Use null meal_type if not stated.\n"
+            f"- history_date: if they ask what they ate on a past day, resolve it (e.g. 'yesterday', 'last Monday') to a date. Use the earliest day for a range. null otherwise.\n\n"
+            f"Message: {text}"}]
     )
-    result = resp.content[0].text.strip()
-    if result.upper() == "NO":
-        return "NO"
-    try:
-        asked_date = datetime.strptime(result, "%Y-%m-%d").date()
-        cutoff = today_bkk - timedelta(days=30)
-        if asked_date < cutoff:
-            return "TOO_OLD"
-        return result
-    except ValueError:
-        return "NO"
+    return parse_triage_json(resp.content[0].text)
 
 
 def build_meal_history_context(meals: list, date_str: str) -> str:
@@ -397,14 +398,6 @@ def handle_text(event):
     except Exception as e:
         print(f"last_active update error: {e}")
 
-    # YOL-31: Retroactive meal type correction from follow-up text (silent, no early return)
-    meal_kw = detect_meal_keyword(text)
-    if meal_kw:
-        try:
-            update_last_meal_type(user_id, meal_kw)
-        except Exception as e:
-            print(f"Meal type update error for {user_id}: {e}")
-
     # YOL-21: Input length guard — cap at 500 chars before any Claude call
     if len(text) > 500:
         _reply(event.reply_token, TOO_LONG_TH if lang == "th" else TOO_LONG_EN)
@@ -478,10 +471,16 @@ Rules: max 4 sentences, max 1 emoji at the end, plain text only, reply in {lang_
         _reply(event.reply_token, resp.content[0].text)
         return
 
-    # YOL-25: Skip off-topic classifier for short / conversational messages
-    if not is_conversational(text) and classify_off_topic(text):
-        # YOL-29: Rapid-fire detection — 3+ strikes within 120s → immediate block
-        if is_rapid_off_topic(user_id):
+    # Single triage call (off-topic? meals? history date?) — replaces 4 Haiku calls.
+    # YOL-25: short / conversational acks skip triage entirely → straight to Sonnet.
+    if is_conversational(text):
+        triage = {"on_topic": True, "meals": [], "history_date": None}
+    else:
+        triage = triage_message(text)
+
+    # YOL-12/29: Off-topic handling
+    if not triage["on_topic"]:
+        if is_rapid_off_topic(user_id):          # YOL-29: 3+ strikes within 120s → block now
             force_block(user_id)
             try:
                 log_event(user_id, "block_triggered")
@@ -503,31 +502,42 @@ Rules: max 4 sentences, max 1 emoji at the end, plain text only, reply in {lang_
         _reply(event.reply_token, msg)
         return
 
-    # YOL-24/32: Silently log all meals reported in text (multi-meal support)
+    # YOL-24/32: Silently log all meals reported in the message
+    logged_any = False
     try:
-        if classify_meal_report(text):
-            for entry in extract_meals_from_text(text):
-                dish = entry.get("dish", "").strip()[:200]
-                meal_type = entry.get("meal_type") or None
-                if dish:
-                    log_meal(user_id, dish, source="text", meal_type=meal_type)
+        for entry in triage["meals"]:
+            dish = (entry.get("dish") or "").strip()[:200]
+            if dish:
+                log_meal(user_id, dish, source="text", meal_type=entry.get("meal_type") or None)
+                logged_any = True
     except Exception as e:
         print(f"Text meal log error for {user_id}: {e}")  # Non-fatal
 
-    # YOL-16: Meal history intent detection
-    date_intent = detect_date_intent(text)
-    if date_intent == "TOO_OLD":
+    # YOL-31: Retroactive meal-type correction from a follow-up message (e.g. photo then
+    # "อาหารเช้านะ"). Only when triage extracted no meals of its own, so we don't fight it.
+    if not logged_any:
+        meal_kw = detect_meal_keyword(text)
+        if meal_kw:
+            try:
+                update_last_meal_type(user_id, meal_kw)
+            except Exception as e:
+                print(f"Meal type update error for {user_id}: {e}")
+
+    # YOL-16: Meal history — inject requested day + today's meals as context
+    today_date = datetime.now(BKK).date()
+    today_str = str(today_date)
+    hist_date = cap_history_date(triage["history_date"], today_date)
+    if hist_date == "TOO_OLD":
         _reply(event.reply_token, HISTORY_LIMIT_TH if lang == "th" else HISTORY_LIMIT_EN)
         return
 
     meal_context_parts = []
-    if date_intent != "NO":
-        asked_dt = BKK.localize(datetime.strptime(date_intent, "%Y-%m-%d"))
+    if hist_date:
+        asked_dt = BKK.localize(datetime.strptime(hist_date, "%Y-%m-%d"))
         history_meals = get_meals_by_date_range(user_id, asked_dt, asked_dt + timedelta(days=1))
-        meal_context_parts.append(build_meal_history_context(history_meals, date_intent))
+        meal_context_parts.append(build_meal_history_context(history_meals, hist_date))
 
-    today_str = str(datetime.now(BKK).date())
-    if date_intent != today_str:
+    if hist_date != today_str:
         today_meals = get_today_meals(user_id)
         if today_meals:
             meal_context_parts.append(build_meal_history_context(today_meals, today_str))
@@ -538,19 +548,18 @@ Rules: max 4 sentences, max 1 emoji at the end, plain text only, reply in {lang_
     if meal_context_parts:
         system += "\n\nMEAL CONTEXT (use this when answering questions about what was eaten):\n" + "\n".join(meal_context_parts)
 
-    # YOL-19: Append user message and call Claude with full history
+    # YOL-19: Call Claude with prior history + this turn, then commit BOTH turns only on
+    # success — appending the user turn before the call corrupts history if the call throws.
     history = conversation_history.setdefault(line_user_id, [])
-    history.append({"role": "user", "content": text})
-
     resp = claude.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=300,
         system=system,
-        messages=history,
+        messages=history + [{"role": "user", "content": text}],
     )
     reply_text = resp.content[0].text
 
-    # YOL-19: Store assistant reply, trim history to last 10 entries (5 pairs)
+    history.append({"role": "user", "content": text})
     history.append({"role": "assistant", "content": reply_text})
     if len(history) > 10:
         conversation_history[line_user_id] = history[-10:]
@@ -671,10 +680,10 @@ Meals logged today:
 {"⚠️ No dinner logged yet." if not has_dinner else ""}
 
 Write a structured summary following this exact template:
-1. What you ate today — one warm sentence listing the meals (use the dish names above)
-2. Goal progress — one sentence connecting today's eating to their goal
-{"3. Dinner wish — one kind, brief sentence wishing them a healthy dinner" if not has_dinner else ""}
-{"3" if not has_dinner else "3"}. Tomorrow tip — one specific, practical suggestion for tomorrow
+- What you ate today — one warm sentence listing the meals (use the dish names above)
+- Goal progress — one sentence connecting today's eating to their goal
+{"- Dinner wish — one kind, brief sentence wishing them a healthy dinner" if not has_dinner else ""}
+- Tomorrow tip — one specific, practical suggestion for tomorrow
 
 STRICT FORMATTING — LINE does not render markdown:
 - NEVER use **, *, __, _, #, or any markdown symbols
@@ -833,11 +842,12 @@ def admin_stats(request: Request):
     active_today = sum(1 for u in users if (u.get("last_active_at") or "") >= today_start)
     active_this_week = sum(1 for u in users if (u.get("last_active_at") or "") >= week_ago)
     goal_breakdown = {}
-    never_logged = 0
     for u in users:
         goal_breakdown[u.get("goal", "no_goal")] = goal_breakdown.get(u.get("goal", "no_goal"), 0) + 1
 
     meals_all = supabase.table("meals").select("*").execute().data
+    users_with_meals = {m.get("user_id") for m in meals_all}
+    drop_off = sum(1 for u in users if u["id"] not in users_with_meals)  # registered, never logged
     meals_today = [m for m in meals_all if m.get("logged_at", "") >= today_start]
     meals_week = [m for m in meals_all if m.get("logged_at", "") >= week_ago]
     from collections import Counter
@@ -860,6 +870,7 @@ def admin_stats(request: Request):
             "new_this_week": new_this_week,
             "active_today": active_today,
             "active_this_week": active_this_week,
+            "drop_off": drop_off,
             "goal_breakdown": goal_breakdown,
         },
         "meals": {
