@@ -191,13 +191,15 @@ users
 ├── line_user_id    TEXT UNIQUE NOT NULL   ← LINE's stable user identifier
 ├── goal            TEXT DEFAULT 'no_goal' ← lose_weight|eat_clean|build_muscle|no_goal
 ├── language        TEXT DEFAULT 'th'      ← th|en (auto-detected per message)
-└── created_at      TIMESTAMPTZ DEFAULT NOW()
+├── created_at      TIMESTAMPTZ DEFAULT NOW()
+└── last_active_at  TIMESTAMPTZ            ← updated on every message received (YOL-35)
 
 meals
 ├── id              UUID PK
 ├── user_id         UUID FK → users.id ON DELETE CASCADE
 ├── description     TEXT  ← dish name (max 200 chars)
 ├── meal_type       TEXT  ← breakfast|lunch|dinner|snack|late_snack (time-derived)
+├── source          TEXT DEFAULT 'photo'   ← photo|text (YOL-35)
 └── logged_at       TIMESTAMPTZ DEFAULT NOW()
 
 off_topic_log
@@ -206,12 +208,20 @@ off_topic_log
 ├── count           INTEGER DEFAULT 0  ← resets to 0 after block triggered
 ├── blocked_until   TIMESTAMPTZ        ← NULL = not blocked
 └── updated_at      TIMESTAMPTZ DEFAULT NOW()
+
+event_log                                  ← engagement audit trail (YOL-35)
+├── id              UUID PK
+├── user_id         UUID FK → users.id ON DELETE CASCADE
+├── event_type      TEXT NOT NULL  ← daily_summary_sent|weekly_summary_sent|
+│                                     block_triggered|dashboard_requested|unblock
+└── created_at      TIMESTAMPTZ DEFAULT NOW()
 ```
 
 **Relationships:**
 ```
 users ──< meals           (one user → many meal records)
 users ──| off_topic_log   (one user → zero or one off-topic record)
+users ──< event_log       (one user → many event records)
 ```
 
 ---
@@ -271,9 +281,6 @@ users ──| off_topic_log   (one user → zero or one off-topic record)
 | No image size validation | Memory spike on large image uploads | Before public launch |
 | No structured logging / error tracking | Hard to diagnose prod failures | Soon |
 | Single Railway service | No horizontal scaling | >1000 concurrent users |
-| `source` column absent from meals table | Schema diagram and code don't record photo vs text source | Next schema migration |
-| No `last_active_at` on users | Can't filter inactive users for summaries | Before scaling summaries |
-| No `event_log` table | Can't audit summary delivery or block events | Before analytics |
 
 ---
 
@@ -291,8 +298,7 @@ users ──| off_topic_log   (one user → zero or one off-topic record)
 - Separate Railway services: API server + scheduler worker
 - Queue webhook processing (Railway Redis or managed queue)
 - Database indexes on `meals.user_id + logged_at`, `off_topic_log.user_id`
-- Add `event_log` table for delivery audit trail
-- Read replicas for analytics queries
+- Read replicas for analytics queries (event_log already in place)
 
 ---
 
