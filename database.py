@@ -51,6 +51,21 @@ def log_event(user_id: str, event_type: str):
     ).execute()
 
 
+def update_user_suggestion(user_id: str, suggestion: str):
+    """YOL-43: Store the latest coaching move + timestamp for follow-through detection."""
+    supabase.table("users").update({
+        "last_suggestion": suggestion,
+        "last_suggestion_at": datetime.now(timezone.utc).isoformat(),
+    }).eq("id", user_id).execute()
+
+
+def clear_user_suggestion(user_id: str):
+    """YOL-44: Clear the stored suggestion so a follow-through only celebrates once."""
+    supabase.table("users").update(
+        {"last_suggestion": None}
+    ).eq("id", user_id).execute()
+
+
 # ── MEALS ─────────────────────────────────────────────────────────────────────
 
 def _meal_type_from_time() -> str:

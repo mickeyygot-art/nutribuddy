@@ -7,7 +7,9 @@ CREATE TABLE IF NOT EXISTS users (
   goal TEXT DEFAULT 'no_goal',        -- lose_weight | eat_clean | build_muscle | no_goal
   language TEXT DEFAULT 'th',         -- th | en
   created_at TIMESTAMPTZ DEFAULT NOW(),
-  last_active_at TIMESTAMPTZ          -- YOL-35: updated on every message
+  last_active_at TIMESTAMPTZ,         -- YOL-35: updated on every message
+  last_suggestion TEXT,              -- YOL-43: last coaching move sent (for follow-through)
+  last_suggestion_at TIMESTAMPTZ     -- YOL-43: when that suggestion was sent
 );
 
 CREATE TABLE IF NOT EXISTS meals (
@@ -39,3 +41,7 @@ CREATE TABLE IF NOT EXISTS event_log (
 -- ALTER TABLE users ADD COLUMN IF NOT EXISTS last_active_at TIMESTAMPTZ;
 -- ALTER TABLE meals ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'photo';
 -- CREATE TABLE IF NOT EXISTS event_log ( ... ); -- see above
+
+-- YOL-43: Coaching follow-through columns
+-- ALTER TABLE users ADD COLUMN IF NOT EXISTS last_suggestion TEXT;
+-- ALTER TABLE users ADD COLUMN IF NOT EXISTS last_suggestion_at TIMESTAMPTZ;

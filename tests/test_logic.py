@@ -694,6 +694,66 @@ def test_transactional_history():
     run("Ends with assistant", h[-1]["role"] == "assistant")
 
 
+MEAL_TYPE_TH = {
+    "breakfast": "เช้า", "lunch": "กลางวัน", "dinner": "เย็น",
+    "snack": "ของว่าง", "late_snack": "มื้อดึก",
+}
+
+
+def build_daily_recap(meals: list, lang: str) -> str:
+    """Pure mirror of main.build_daily_recap (YOL-43)."""
+    parts = []
+    for m in meals:
+        mtype = m.get("meal_type", "")
+        label = MEAL_TYPE_TH.get(mtype, mtype) if lang == "th" else mtype
+        parts.append(f"{m['description']} ({label})" if label else m["description"])
+    joined = ", ".join(parts)
+    if lang == "th":
+        return f"วันนี้คุณกิน: {joined} 🍽️"
+    return f"Today you had: {joined} 🍽️"
+
+
+def is_suggestion_fresh(last_at_iso, now) -> bool:
+    """Pure mirror of main.is_suggestion_fresh (YOL-44)."""
+    from datetime import datetime as _dt, timedelta as _td
+    if not last_at_iso:
+        return False
+    try:
+        last_at = _dt.fromisoformat(str(last_at_iso).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return False
+    return (now - last_at) < _td(hours=36)
+
+
+def test_daily_recap():
+    print("=== Daily recap builder (YOL-43) ===")
+    meals = [
+        {"description": "ข้าวมันไก่", "meal_type": "breakfast"},
+        {"description": "กะเพราหมู", "meal_type": "lunch"},
+    ]
+    th = build_daily_recap(meals, "th")
+    run("TH recap prefix", th.startswith("วันนี้คุณกิน:"))
+    run("TH localizes meal type", "(เช้า)" in th and "(กลางวัน)" in th)
+    run("TH ends with emoji", th.endswith("🍽️"))
+    en = build_daily_recap(meals, "en")
+    run("EN recap prefix", en.startswith("Today you had:"))
+    run("EN keeps english type", "(breakfast)" in en and "(lunch)" in en)
+    run("Both dishes present", "ข้าวมันไก่" in th and "กะเพราหมู" in th)
+
+
+def test_suggestion_freshness():
+    print("=== Suggestion freshness 36h (YOL-44) ===")
+    from datetime import datetime, timezone, timedelta
+    now = datetime.now(timezone.utc)
+    run("None → not fresh", not is_suggestion_fresh(None, now))
+    run("Empty → not fresh", not is_suggestion_fresh("", now))
+    run("1h ago → fresh", is_suggestion_fresh((now - timedelta(hours=1)).isoformat(), now))
+    run("35h ago → fresh", is_suggestion_fresh((now - timedelta(hours=35)).isoformat(), now))
+    run("37h ago → stale", not is_suggestion_fresh((now - timedelta(hours=37)).isoformat(), now))
+    run("Malformed → not fresh", not is_suggestion_fresh("not-a-date", now))
+    run("Z suffix parsed", is_suggestion_fresh((now - timedelta(hours=2)).isoformat().replace("+00:00", "Z"), now))
+
+
 def test_conversational_whitelist():
     print("=== Conversational whitelist (YOL-25) ===")
     # Whitelist items → skip classifier
@@ -767,6 +827,8 @@ if __name__ == "__main__":
         test_triage_parsing,
         test_cap_history_date,
         test_transactional_history,
+        test_daily_recap,
+        test_suggestion_freshness,
         test_conversational_whitelist,
         test_meal_report_detection,
         test_clean_for_line,

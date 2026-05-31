@@ -21,6 +21,7 @@ from database import (
     log_meal, get_today_meals, get_meals_by_date_range, get_week_meals,
     is_blocked, clear_block, force_block, increment_off_topic, get_all_users,
     update_last_meal_type, update_last_active, log_event, supabase,
+    update_user_suggestion, clear_user_suggestion,
 )
 
 app = FastAPI()
@@ -75,6 +76,16 @@ UNKNOWN_DISH_EN = "(Not sure what this dish is — could you tell me the name?)"
 
 WEEKLY_NO_MEALS_TH = "สัปดาห์นี้ยังไม่ได้ส่งรูปอาหารมาเลยนะ — สัปดาห์หน้าลองเริ่มด้วยมื้อเดียวก็ได้ 🍽️"
 WEEKLY_NO_MEALS_EN = "No meals logged this week — next week, try starting with just one photo 🍽️"
+
+# YOL-43: Daily summary — no-meals fallback (Message 1 only, no Claude call)
+DAILY_NO_MEALS_TH = "วันนี้ยังไม่มีมื้อไหนเลยนะ — ไม่เป็นไร คืนนี้ยังทัน 🌿"
+DAILY_NO_MEALS_EN = "Nothing logged today — still time to catch dinner tonight 🌿"
+
+# YOL-43: Thai labels for meal types in the daily recap
+MEAL_TYPE_TH = {
+    "breakfast": "เช้า", "lunch": "กลางวัน", "dinner": "เย็น",
+    "snack": "ของว่าง", "late_snack": "มื้อดึก",
+}
 
 UNBLOCK_KEYWORDS = {
     "เริ่มใหม่", "ขอโทษ", "ยกเลิก", "unblock",
@@ -337,6 +348,69 @@ def build_meal_history_context(meals: list, date_str: str) -> str:
     return f"Meal history for {date_str}: {parts}"
 
 
+def build_daily_recap(meals: list, lang: str) -> str:
+    """YOL-43: Message 1 — factual recap of today's meals, no judgment, no Claude call."""
+    parts = []
+    for m in meals:
+        mtype = m.get("meal_type", "")
+        label = MEAL_TYPE_TH.get(mtype, mtype) if lang == "th" else mtype
+        parts.append(f"{m['description']} ({label})" if label else m["description"])
+    joined = ", ".join(parts)
+    if lang == "th":
+        return f"วันนี้คุณกิน: {joined} 🍽️"
+    return f"Today you had: {joined} 🍽️"
+
+
+def is_suggestion_fresh(last_at_iso, now) -> bool:
+    """YOL-44: True if a stored suggestion exists and is < 36 hours old."""
+    if not last_at_iso:
+        return False
+    try:
+        last_at = datetime.fromisoformat(str(last_at_iso).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return False
+    return (now - last_at) < timedelta(hours=36)
+
+
+def check_follow_through(user: dict, dishes: list) -> str | None:
+    """YOL-44: If a logged dish matches yesterday's suggestion, return a celebration
+    message and clear the suggestion (fires once). Returns None otherwise."""
+    from datetime import timezone as _tz
+    suggestion = user.get("last_suggestion")
+    if not suggestion:
+        return None
+    if not is_suggestion_fresh(user.get("last_suggestion_at"), datetime.now(_tz.utc)):
+        return None
+    lang = user.get("language", "th")
+    for dish in dishes:
+        if not dish:
+            continue
+        match = claude.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=5,
+            messages=[{"role": "user", "content":
+                f'Yesterday\'s suggestion: "{suggestion}"\nUser just logged: "{dish}"\n\n'
+                f"Does this meal match or reflect the suggestion? Reply YES or NO only."}]
+        )
+        if match.content[0].text.strip().upper().startswith("YES"):
+            resp = claude.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=80,
+                messages=[{"role": "user", "content":
+                    f'Yesterday you suggested: "{suggestion}"\nUser just logged: "{dish}"\n'
+                    f"User language: {lang}\n\n"
+                    f"Write a short, genuine celebration (1-2 sentences) acknowledging they followed through. "
+                    f"Warm friend tone. Reference both the suggestion and what they ate. 1 emoji max. "
+                    f"Reply in {'Thai' if lang == 'th' else 'English'}."}]
+            )
+            try:
+                clear_user_suggestion(user["id"])
+            except Exception as e:
+                print(f"clear_user_suggestion error for {user['id']}: {e}")
+            return resp.content[0].text
+    return None
+
+
 def _reply(reply_token: str, text: str):
     with ApiClient(configuration) as api_client:
         MessagingApi(api_client).reply_message(
@@ -503,19 +577,27 @@ Rules: max 4 sentences, max 1 emoji at the end, plain text only, reply in {lang_
         return
 
     # YOL-24/32: Silently log all meals reported in the message
-    logged_any = False
+    logged_dishes = []
     try:
         for entry in triage["meals"]:
             dish = (entry.get("dish") or "").strip()[:200]
             if dish:
                 log_meal(user_id, dish, source="text", meal_type=entry.get("meal_type") or None)
-                logged_any = True
+                logged_dishes.append(dish)
     except Exception as e:
         print(f"Text meal log error for {user_id}: {e}")  # Non-fatal
 
+    # YOL-44: celebrate if any logged dish matches yesterday's coaching suggestion
+    celebration = None
+    if logged_dishes:
+        try:
+            celebration = check_follow_through(user, logged_dishes)
+        except Exception as e:
+            print(f"Follow-through error for {user_id}: {e}")
+
     # YOL-31: Retroactive meal-type correction from a follow-up message (e.g. photo then
     # "อาหารเช้านะ"). Only when triage extracted no meals of its own, so we don't fight it.
-    if not logged_any:
+    if not logged_dishes:
         meal_kw = detect_meal_keyword(text)
         if meal_kw:
             try:
@@ -529,6 +611,8 @@ Rules: max 4 sentences, max 1 emoji at the end, plain text only, reply in {lang_
     hist_date = cap_history_date(triage["history_date"], today_date)
     if hist_date == "TOO_OLD":
         _reply(event.reply_token, HISTORY_LIMIT_TH if lang == "th" else HISTORY_LIMIT_EN)
+        if celebration:
+            _push(line_user_id, celebration)
         return
 
     meal_context_parts = []
@@ -565,6 +649,8 @@ Rules: max 4 sentences, max 1 emoji at the end, plain text only, reply in {lang_
         conversation_history[line_user_id] = history[-10:]
 
     _reply(event.reply_token, reply_text)
+    if celebration:
+        _push(line_user_id, celebration)
 
 
 # ── IMAGE ─────────────────────────────────────────────────────────────────────
@@ -625,6 +711,7 @@ def handle_image(event):
         dish_name = lines[0][5:].strip()
         coaching_text = "\n".join(lines[2:]).strip() if len(lines) > 2 else full_response
 
+    celebration = None
     if not dish_name:
         # YOL-23: Unknown dish — append nudge, skip DB logging
         nudge = UNKNOWN_DISH_TH if lang == "th" else UNKNOWN_DISH_EN
@@ -634,6 +721,11 @@ def handle_image(event):
             log_meal(user_id, dish_name, source="photo")
         except Exception as e:
             print(f"Meal log error for {user_id}: {e}")
+        # YOL-44: celebrate if this matches yesterday's coaching suggestion
+        try:
+            celebration = check_follow_through(user, [dish_name])
+        except Exception as e:
+            print(f"Follow-through error for {user_id}: {e}")
 
     # YOL-19: Add photo + reply to conversation history
     history = conversation_history.setdefault(line_user_id, [])
@@ -643,62 +735,77 @@ def handle_image(event):
         conversation_history[line_user_id] = history[-10:]
 
     _reply(event.reply_token, coaching_text)
+    if celebration:
+        _push(line_user_id, celebration)
 
 
 # ── DAILY SUMMARY ─────────────────────────────────────────────────────────────
 
 def send_daily_summaries():
+    # PLAN (YOL-43): 2-message split.
+    #   Message 1 — factual recap (no Claude call).
+    #   Message 2 — one goal-specific coaching move (Sonnet), saved as last_suggestion.
+    #   No meals → Message 1 fallback only, no Message 2, no Claude call.
     for user in get_all_users():
         try:
             meals = get_today_meals(user["id"])
             lang = user["language"]
             line_user_id = user["line_user_id"]
 
+            # Message 1 — recap
             if not meals:
-                msg = ("วันนี้ยังไม่ได้บันทึกอาหารเลยนะ ถ้าเย็นนี้มีมื้ออร่อย ส่งรูปมาให้ดูได้เลย 🍽️"
-                       if lang == "th" else
-                       "No meals logged today — if you're having dinner tonight, send a photo and let's see it 🍽️")
-                _push(line_user_id, msg)
+                _push(line_user_id, DAILY_NO_MEALS_TH if lang == "th" else DAILY_NO_MEALS_EN)
                 continue
+            _push(line_user_id, build_daily_recap(meals, lang))
 
-            # Build structured meal summary by type
+            # Message 2 — one coaching move
             by_type = {}
             for m in meals:
                 by_type.setdefault(m["meal_type"], []).append(m["description"])
-            meal_lines = "\n".join(
-                f"- {mtype.capitalize()}: {', '.join(dishes)}"
-                for mtype, dishes in by_type.items()
+            meal_lines = ", ".join(
+                f"{', '.join(dishes)} ({mtype})" for mtype, dishes in by_type.items()
             )
-            has_dinner = "dinner" in by_type
-            goal_label = GOAL_LABEL.get(user["goal"], "no specific goal")
-            lang_word = "Thai" if lang == "th" else "English"
+            goal = user.get("goal", "no_goal")
+            goal_label = GOAL_LABEL.get(goal, "no specific goal")
+            last_suggestion = user.get("last_suggestion") or "none"
 
-            prompt = f"""Daily summary for a NutriBuddy user.
-Goal: {goal_label}
-Meals logged today:
-{meal_lines}
-{"⚠️ No dinner logged yet." if not has_dinner else ""}
+            coaching_focus = {
+                "lose_weight":  "Suggest one lower-cal swap or smaller portion for a specific meal tomorrow.",
+                "eat_clean":    "Suggest one vegetable to add or one processed item to reduce — name it specifically.",
+                "build_muscle": "Suggest one protein source to add tomorrow — name the dish.",
+                "no_goal":      "Suggest one positive habit: hydration, color variety, or meal timing.",
+            }.get(goal, "Suggest one specific, practical habit for tomorrow.")
 
-Write a structured summary following this exact template:
-- What you ate today — one warm sentence listing the meals (use the dish names above)
-- Goal progress — one sentence connecting today's eating to their goal
-{"- Dinner wish — one kind, brief sentence wishing them a healthy dinner" if not has_dinner else ""}
-- Tomorrow tip — one specific, practical suggestion for tomorrow
+            prompt = f"""User ate today: {meal_lines}
+User goal: {goal_label}
+Yesterday's suggestion (if any): {last_suggestion}
 
-STRICT FORMATTING — LINE does not render markdown:
-- NEVER use **, *, __, _, #, or any markdown symbols
-- NEVER use bullet points or numbered lists in the reply
-- Plain text only, like an SMS message
-- Max 1 emoji total, at the end of a sentence only
-- Max 4 short sentences total
-- Warm friend tone, reply in {lang_word}"""
+{coaching_focus}
+
+Write ONE coaching move for tomorrow. Rules:
+- 1-2 sentences max
+- Name a specific dish or ingredient, not a vague category
+- Don't repeat yesterday's suggestion if shown above
+- Warm friend tone, no lecturing
+- Reply in {"Thai" if lang == "th" else "English"}
+- End with exactly 1 emoji
+- Do NOT mention calories or numbers
+- Plain text only, no markdown"""
 
             resp = claude.messages.create(
                 model="claude-sonnet-4-6",
-                max_tokens=250,
+                max_tokens=120,
                 messages=[{"role": "user", "content": prompt}],
             )
-            _push(line_user_id, resp.content[0].text)
+            move = resp.content[0].text
+            _push(line_user_id, move)
+
+            # YOL-43: store the move for follow-through detection (YOL-44)
+            try:
+                update_user_suggestion(user["id"], clean_for_line(move))
+            except Exception as e:
+                print(f"update_user_suggestion error for {user['id']}: {e}")
+
             try:
                 log_event(user["id"], "daily_summary_sent")
             except Exception:
