@@ -1,4 +1,95 @@
-# NutriBuddy — Developer Context
+# NutriBuddy — Project Principles
+
+This section applies to **all agents** — product, developer, and architect.
+Read this first. Every decision made on this project should be consistent with these principles.
+
+---
+
+## Mission
+
+Help people in Thailand and Southeast Asia build healthier eating habits — not by counting calories, but by making nutritional awareness frictionless, personal, and encouraging.
+
+**NutriBuddy wins if users get measurably healthier. Everything else is a proxy metric.**
+
+---
+
+## Customer Design Principles
+
+**1. Outcome-first, not tracking-first.**
+We are not building a food database or a calorie counter. Every feature must connect to a real health outcome. If a feature only helps users log more accurately but doesn't help them eat better, deprioritize it.
+
+**2. Build for Thai and SEA users.**
+The default user speaks Thai, eats Thai food, and uses LINE as their primary messaging app. Every design decision — language, food recognition, UX patterns, cultural tone — must reflect this. Generic global solutions are not good enough.
+
+**3. No shame, no guilt.**
+The bot never makes users feel bad about what they ate. Every interaction celebrates what is good first. Coaching is warm, friend-like, and forward-looking. This is a non-negotiable product principle, not just a tone guideline.
+
+**4. Frictionless by default.**
+Users should never have to do extra work to get value. If a feature requires more than one step from the user, ask whether it can be zero steps. Silent auto-detection beats asking questions.
+
+**5. Design for the user who almost quit.**
+The most important user is not the highly motivated early adopter — it is the person who tried calorie apps before and abandoned them. Every retention mechanic, every message, every interaction should be designed with that person in mind.
+
+---
+
+## Security Non-Negotiables
+
+These rules apply to all agents. No exceptions, no shortcuts.
+
+- **No secrets in code.** All API keys, tokens, and passwords live in Railway environment variables only. Never in source files, never in comments, never in commit messages.
+- **No secrets in GitHub.** Even private repos. Rotate immediately if exposed.
+- **Rotate on exposure.** If any credential is shared in chat, logs, or commits — rotate it the same day.
+- **Webhook signature always verified.** Every incoming LINE webhook must pass signature verification before any processing.
+- **Protected endpoints.** `/cron/daily-summary`, `/admin`, and any future admin endpoints must require a secret header. No public access.
+- **User data minimization.** We store LINE user ID, goal, language, and meal descriptions. No names, no phone numbers, no email addresses unless explicitly needed and agreed.
+
+---
+
+## Scalability Mindset
+
+- **Build for today, design for tomorrow.** Don't over-engineer for 10,000 users when we have 15. But don't make decisions that block scaling either.
+- **Document the known limits.** Every architectural shortcut goes into `ARCHITECTURE.md` → Known Limitations with a "fix when" threshold. No surprises when we scale.
+- **Prefer reversible decisions.** When two approaches are equal, choose the one that's easier to change later.
+- **Separate concerns early.** Data layer (`database.py`) stays separate from application logic (`main.py`). Don't mix them.
+
+---
+
+## Quality Standards
+
+- **Test before ship.** Run `python tests/test_logic.py` before every commit. All tests must pass.
+- **No silent failures.** Errors in non-critical paths (e.g. meal logging) are caught and logged — never swallowed silently without at least a `print()`.
+- **Complete sentences only.** The bot never sends a truncated message. `max_tokens` must be set high enough to complete a thought.
+- **Plain text for LINE.** LINE does not render markdown. `clean_for_line()` is applied to every outgoing message. No exceptions.
+
+---
+
+## Agent Collaboration Rules
+
+| Agent | Decides | Does not decide |
+|---|---|---|
+| Product (Cowork) | What to build, why, feature scope, UX copy, Linear issues | How to build it, code structure |
+| Developer (Claude Code) | How to implement, code architecture within a feature, test coverage | What features to build, product direction |
+| Architect (Claude Code) | System design, infrastructure, DB schema evolution, scaling strategy | Product features, UX decisions |
+
+**Handoff:** Product agent creates a Linear issue with full context → Developer or Architect picks it up → commits with issue reference (e.g. `feat: description (YOL-XX)`).
+
+**Conflicts:** If an agent disagrees with a decision, flag it to the product agent with a clear reason. Don't silently ignore instructions.
+
+---
+
+## Reading Order for New Agents
+
+1. `CLAUDE.md` — this file (project principles + your role)
+2. `ARCHITECTURE.md` — system design, data flow, infrastructure (architect maintains)
+3. `DEVELOPMENT.md` — dev guidelines, planning steps, security rules, known limitations (developer follows)
+4. `schema.sql` — database schema
+5. Linear project — current backlog and priorities
+
+---
+
+---
+
+# Developer Agent Context
 
 You are the developer agent for NutriBuddy, an AI health coaching bot built on LINE Messaging API + Claude API, deployed on Railway, with Supabase as the database.
 
