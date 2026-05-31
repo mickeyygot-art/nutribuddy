@@ -1,6 +1,7 @@
 import os
 import base64
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request, HTTPException
 from linebot.v3 import WebhookHandler
@@ -23,8 +24,17 @@ from database import (
     update_last_meal_type, update_last_active, log_event, supabase,
     update_user_suggestion, clear_user_suggestion,
 )
+import tracking
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    # YOL-45: flush buffered PostHog events before the container stops
+    tracking.shutdown()
+
+
+app = FastAPI(lifespan=lifespan)
 
 configuration = Configuration(access_token=os.environ["LINE_CHANNEL_ACCESS_TOKEN"].strip())
 handler = WebhookHandler(os.environ["LINE_CHANNEL_SECRET"].strip())
@@ -442,10 +452,21 @@ async def webhook(request: Request):
 
 @handler.add(FollowEvent)
 def handle_follow(event):
-    get_or_create_user(event.source.user_id)
+    user = get_or_create_user(event.source.user_id)
     _reply(event.reply_token, ONBOARDING_MSG_1)
     time.sleep(1)
     _push(event.source.user_id, ONBOARDING_MSG_2)
+    # YOL-45: analytics — user.joined
+    try:
+        tracking.track_user_joined(event.source.user_id)
+        tracking.identify_user(
+            event.source.user_id,
+            goal=user["goal"],
+            language=user["language"],
+            meals_logged_count=0,
+        )
+    except Exception as e:
+        print(f"Analytics error (user.joined): {e}")
 
 
 # ── TEXT ──────────────────────────────────────────────────────────────────────
@@ -497,6 +518,19 @@ def handle_text(event):
     goal = detect_goal(text)
     if goal:
         update_user_goal(line_user_id, goal)
+        # YOL-45: analytics — goal.set
+        try:
+            is_initial = user["goal"] == "no_goal"
+            tracking.track_goal_set(
+                line_user_id,
+                goal=goal,
+                previous_goal=user["goal"] if not is_initial else None,
+                is_initial_set=is_initial,
+                set_method="digit_reply" if text.strip() in GOAL_DIGITS else "phrase",
+            )
+            tracking.identify_user(line_user_id, goal=goal, language=lang)
+        except Exception as e:
+            print(f"Analytics error (goal.set): {e}")
         label = GOAL_LABEL[goal]
         msg = (f"บันทึกเป้าหมายใหม่แล้วนะ: {label} 💪"
                if lang == "th" else f"Goal updated: {label} 💪")

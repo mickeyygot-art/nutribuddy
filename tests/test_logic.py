@@ -725,6 +725,21 @@ def is_suggestion_fresh(last_at_iso, now) -> bool:
     return (now - last_at) < _td(hours=36)
 
 
+def tracking_guard(disabled: bool, api_key: str, internal_ids: set, line_id: str) -> bool:
+    """Pure mirror of tracking._guard (YOL-45) — who gets excluded from analytics."""
+    return disabled or not api_key or line_id in internal_ids
+
+
+def test_tracking_guard():
+    print("=== Analytics exclusion guard (YOL-45) ===")
+    key = "phc_real"
+    run("Normal user → tracked", not tracking_guard(False, key, set(), "Uabc"))
+    run("POSTHOG_DISABLED → skipped", tracking_guard(True, key, set(), "Uabc"))
+    run("No API key → skipped", tracking_guard(False, "", set(), "Uabc"))
+    run("Internal ID → skipped", tracking_guard(False, key, {"Ume"}, "Ume"))
+    run("Non-internal among internals → tracked", not tracking_guard(False, key, {"Ume"}, "Uother"))
+
+
 def test_daily_recap():
     print("=== Daily recap builder (YOL-43) ===")
     meals = [
@@ -827,6 +842,7 @@ if __name__ == "__main__":
         test_triage_parsing,
         test_cap_history_date,
         test_transactional_history,
+        test_tracking_guard,
         test_daily_recap,
         test_suggestion_freshness,
         test_conversational_whitelist,

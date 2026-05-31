@@ -6,3 +6,4 @@ supabase
 apscheduler
 pytz
 python-dotenv
+posthog
