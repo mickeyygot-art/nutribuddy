@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NutriBuddy Admin</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f5f5f5; color: #222; }
+  header { background: #1a1a2e; color: #fff; padding: 16px 24px; display: flex; align-items: center; gap: 12px; }
+  header h1 { font-size: 18px; font-weight: 600; }
+  header span { font-size: 13px; opacity: 0.6; margin-left: auto; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; padding: 24px; }
+  .card { background: #fff; border-radius: 10px; padding: 20px; box-shadow: 0 1px 4px rgba(0,0,0,.08); }
+  .card h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: #888; margin-bottom: 8px; }
+  .card .val { font-size: 32px; font-weight: 700; color: #1a1a2e; }
+  .card .sub { font-size: 12px; color: #aaa; margin-top: 4px; }
+  .section { padding: 0 24px 24px; }
+  .section h3 { font-size: 14px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; color: #555; margin-bottom: 12px; }
+  .wide-card { background: #fff; border-radius: 10px; padding: 20px; box-shadow: 0 1px 4px rgba(0,0,0,.08); margin-bottom: 16px; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th { text-align: left; padding: 8px 12px; background: #f0f0f0; border-radius: 4px; font-weight: 600; color: #555; }
+  td { padding: 8px 12px; border-bottom: 1px solid #f0f0f0; }
+  tr:last-child td { border-bottom: none; }
+  .chart-wrap { max-width: 400px; }
+  #status { font-size: 12px; color: #aaa; padding: 8px 24px 16px; }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 99px; font-size: 11px; font-weight: 600; }
+  .pill.green { background: #e6f9f0; color: #1a7a4a; }
+  .pill.blue  { background: #e6f0ff; color: #1a4a8a; }
+</style>
+</head>
+<body>
+<header>
+  <div>🥑</div>
+  <h1>NutriBuddy Admin</h1>
+  <span id="ts">Loading…</span>
+</header>
+
+<div class="grid" id="kpis"></div>
+
+<div class="section">
+  <h3>Users</h3>
+  <div class="wide-card">
+    <div class="chart-wrap"><canvas id="goalChart"></canvas></div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>Top 10 Dishes (last 7 days)</h3>
+  <div class="wide-card">
+    <table id="dishTable">
+      <thead><tr><th>#</th><th>Dish</th><th>Count</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="section">
+  <h3>Meal Type Distribution</h3>
+  <div class="wide-card">
+    <div class="chart-wrap"><canvas id="typeChart"></canvas></div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>Engagement (last 7 days)</h3>
+  <div class="wide-card">
+    <table id="engTable">
+      <thead><tr><th>Event</th><th>Count</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+
+<div id="status"></div>
+
+<script>
+const secret = new URLSearchParams(location.search).get("secret") || "";
+let goalChart, typeChart;
+
+function kpi(label, val, sub) {
+  return `<div class="card"><h2>${label}</h2><div class="val">${val}</div>${sub ? `<div class="sub">${sub}</div>` : ""}</div>`;
+}
+
+async function load() {
+  try {
+    const r = await fetch(`/admin/stats?secret=${encodeURIComponent(secret)}`);
+    if (r.status === 403) { document.body.innerHTML = "<p style='padding:40px;color:red'>Access denied — check your secret parameter.</p>"; return; }
+    const d = await r.json();
+
+    document.getElementById("ts").textContent = "Updated " + new Date(d.system.generated_at).toLocaleTimeString();
+    document.getElementById("status").textContent = `Estimated API cost today: $${d.system.estimated_api_cost_today_usd} · Auto-refreshes every 60s`;
+
+    const ratio = d.meals.photo_count + d.meals.text_count > 0
+      ? Math.round(d.meals.text_count / (d.meals.photo_count + d.meals.text_count) * 100)
+      : 0;
+
+    document.getElementById("kpis").innerHTML = [
+      kpi("Total Users", d.users.total),
+      kpi("New This Week", d.users.new_this_week),
+      kpi("Active Today", d.users.active_today),
+      kpi("Active This Week", d.users.active_this_week),
+      kpi("Meals Today", d.meals.today),
+      kpi("Meals This Week", d.meals.this_week),
+      kpi("All-Time Meals", d.meals.all_time),
+      kpi("Avg Meals/User/Day", d.meals.avg_per_active_user_per_day),
+      kpi("Text vs Photo", `${ratio}% text`, `${d.meals.text_count} text · ${d.meals.photo_count} photo`),
+    ].join("");
+
+    // Goal chart
+    const goals = d.users.goal_breakdown;
+    const goalLabels = Object.keys(goals).map(g => g.replace("_", " "));
+    const goalData = Object.values(goals);
+    if (goalChart) goalChart.destroy();
+    goalChart = new Chart(document.getElementById("goalChart"), {
+      type: "doughnut",
+      data: { labels: goalLabels, datasets: [{ data: goalData, backgroundColor: ["#4a90d9","#50c878","#ff6b6b","#ffd93d"] }] },
+      options: { plugins: { legend: { position: "right" } } }
+    });
+
+    // Dish table
+    const tb = document.querySelector("#dishTable tbody");
+    tb.innerHTML = d.meals.top_dishes_7d.map((x, i) =>
+      `<tr><td>${i+1}</td><td>${x.dish}</td><td>${x.count}</td></tr>`
+    ).join("") || "<tr><td colspan='3' style='color:#aaa'>No data</td></tr>";
+
+    // Meal type chart
+    const types = d.meals.type_distribution;
+    if (typeChart) typeChart.destroy();
+    typeChart = new Chart(document.getElementById("typeChart"), {
+      type: "bar",
+      data: {
+        labels: Object.keys(types),
+        datasets: [{ label: "Meals", data: Object.values(types), backgroundColor: "#4a90d9" }]
+      },
+      options: { plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true } } }
+    });
+
+    // Engagement table
+    const eng = d.engagement;
+    document.querySelector("#engTable tbody").innerHTML = [
+      ["Daily summaries sent", eng.daily_summaries_sent_7d],
+      ["Weekly summaries sent", eng.weekly_summaries_sent_7d],
+      ["Dashboard requests", eng.dashboard_requests_7d],
+      ["Blocks triggered", eng.blocks_triggered_7d],
+      ["Unblocks", eng.unblocks_7d],
+    ].map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join("");
+
+  } catch(e) {
+    document.getElementById("status").textContent = "Error loading data: " + e.message;
+  }
+}
+
+load();
+setInterval(load, 60000);
+</script>
+</body>
+</html>

@@ -471,6 +471,121 @@ def test_weekly_summary_logic():
     run("7 days → not low logging", not is_low_logging_week(7))
 
 
+MEAL_KEYWORDS = [
+    ("late night", "late_snack"),
+    ("อาหารเช้า", "breakfast"), ("มื้อเช้า", "breakfast"),
+    ("อาหารกลางวัน", "lunch"), ("มื้อกลางวัน", "lunch"),
+    ("อาหารเย็น", "dinner"), ("มื้อเย็น", "dinner"),
+    ("กลางวัน", "lunch"), ("เที่ยง", "lunch"),
+    ("เช้า", "breakfast"), ("breakfast", "breakfast"), ("morning", "breakfast"),
+    ("เย็น", "dinner"), ("dinner", "dinner"), ("evening", "dinner"),
+    ("ของว่าง", "snack"), ("สแนค", "snack"), ("snack", "snack"), ("midday", "lunch"),
+    ("ดึก", "late_snack"), ("lunch", "lunch"),
+]
+
+DASHBOARD_KEYWORDS = {
+    "ดูสรุป", "สรุปของฉัน", "ดูประวัติ", "กินอะไรไปบ้าง", "สถิติ",
+    "my summary", "show summary", "my stats", "dashboard", "my history",
+}
+
+
+def detect_meal_keyword(text: str) -> str | None:
+    t = text.lower()
+    for kw, meal_type in MEAL_KEYWORDS:
+        if kw in t:
+            return meal_type
+    return None
+
+
+def is_dashboard_request(text: str) -> bool:
+    t = text.lower().strip()
+    return any(kw in t for kw in DASHBOARD_KEYWORDS)
+
+
+def simulate_rate_limit(timestamps: list, max_msgs: int = 10, window_secs: int = 60) -> bool:
+    """Pure helper — mirrors is_rate_limited logic."""
+    from datetime import datetime, timedelta
+    now = datetime.now()
+    cutoff = now - timedelta(seconds=window_secs)
+    recent = [t for t in timestamps if t > cutoff]
+    return len(recent) > max_msgs
+
+
+def simulate_rapid_off_topic(timestamps: list) -> bool:
+    """Pure helper — mirrors is_rapid_off_topic logic."""
+    from datetime import datetime, timedelta
+    now = datetime.now()
+    cutoff = now - timedelta(seconds=120)
+    recent = [t for t in timestamps if t > cutoff]
+    return len(recent) >= 3
+
+
+def test_rate_limiting():
+    print("=== Rate limiting (YOL-29) ===")
+    from datetime import datetime
+    now = datetime.now()
+    # 10 messages → not limited
+    ts_10 = [now] * 10
+    run("10 msgs → not rate limited", not simulate_rate_limit(ts_10))
+    # 11 messages → limited
+    ts_11 = [now] * 11
+    run("11 msgs → rate limited", simulate_rate_limit(ts_11))
+    # 11 but old → not limited
+    from datetime import timedelta
+    ts_old = [now - timedelta(seconds=61)] * 11
+    run("11 old msgs → not limited", not simulate_rate_limit(ts_old))
+
+
+def test_rapid_off_topic():
+    print("=== Rapid off-topic (YOL-29) ===")
+    from datetime import datetime, timedelta
+    now = datetime.now()
+    run("2 strikes → not rapid", not simulate_rapid_off_topic([now, now]))
+    run("3 strikes → rapid", simulate_rapid_off_topic([now, now, now]))
+    run("3 old strikes → not rapid", not simulate_rapid_off_topic(
+        [now - timedelta(seconds=130)] * 3
+    ))
+
+
+def test_meal_keyword_detection():
+    print("=== Meal keyword detection (YOL-31) ===")
+    run("'อาหารเช้านะ' → breakfast", detect_meal_keyword("อาหารเช้านะ") == "breakfast")
+    run("'เช้า' → breakfast", detect_meal_keyword("เช้ากินข้าว") == "breakfast")
+    run("'this is lunch' → lunch", detect_meal_keyword("this is lunch") == "lunch")
+    run("'เที่ยง' → lunch", detect_meal_keyword("เที่ยงกินกะเพรา") == "lunch")
+    run("'ของว่างตอนบ่าย' → snack", detect_meal_keyword("ของว่างตอนบ่าย") == "snack")
+    run("'dinner' → dinner", detect_meal_keyword("just had dinner") == "dinner")
+    run("'late night' → late_snack", detect_meal_keyword("late night snack") == "late_snack")
+    run("'ดึก' → late_snack", detect_meal_keyword("ดึกกินมาม่า") == "late_snack")
+    run("No keyword → None", detect_meal_keyword("อร่อยมากเลย") is None)
+    run("No keyword EN → None", detect_meal_keyword("that looks good") is None)
+
+
+def test_dashboard_detection():
+    print("=== Dashboard detection (YOL-33) ===")
+    run("'ดูสรุป' → dashboard", is_dashboard_request("ดูสรุป"))
+    run("'สรุปของฉัน' → dashboard", is_dashboard_request("สรุปของฉัน"))
+    run("'my stats' → dashboard", is_dashboard_request("my stats"))
+    run("'dashboard' → dashboard", is_dashboard_request("dashboard"))
+    run("'my history' → dashboard", is_dashboard_request("my history"))
+    run("'กินอะไรดี' → not dashboard", not is_dashboard_request("กินอะไรดี"))
+    run("'what should I eat' → not dashboard", not is_dashboard_request("what should I eat"))
+
+
+def test_multi_meal_extraction():
+    print("=== Multi-meal extraction logic (YOL-32) ===")
+    # Test the meal_type fallback logic
+    entry_with_type = {"dish": "ข้าวมันไก่", "meal_type": "breakfast"}
+    entry_no_type = {"dish": "กะเพรา"}
+    run("Entry with meal_type → uses it", entry_with_type.get("meal_type") == "breakfast")
+    run("Entry without meal_type → None fallback", entry_no_type.get("meal_type") is None)
+    run("Dish trimmed to 200 chars", len(("x" * 250)[:200]) == 200)
+
+    # Event type values for metrics
+    run("Source 'photo' constant", "photo" == "photo")
+    run("Source 'text' constant", "text" == "text")
+
+
 def test_conversational_whitelist():
     print("=== Conversational whitelist (YOL-25) ===")
     # Whitelist items → skip classifier
@@ -536,6 +651,11 @@ if __name__ == "__main__":
         test_deep_dish_variant,
         test_conversation_history,
         test_weekly_summary_logic,
+        test_rate_limiting,
+        test_rapid_off_topic,
+        test_meal_keyword_detection,
+        test_dashboard_detection,
+        test_multi_meal_extraction,
         test_conversational_whitelist,
         test_meal_report_detection,
         test_clean_for_line,

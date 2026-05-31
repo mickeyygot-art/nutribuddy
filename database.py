@@ -38,6 +38,20 @@ def get_all_users() -> list:
     return supabase.table("users").select("*").execute().data
 
 
+def update_last_active(user_id: str):
+    """YOL-35: Stamp last_active_at on every incoming message."""
+    supabase.table("users").update(
+        {"last_active_at": datetime.now(timezone.utc).isoformat()}
+    ).eq("id", user_id).execute()
+
+
+def log_event(user_id: str, event_type: str):
+    """YOL-35: Append an event row for engagement metrics."""
+    supabase.table("event_log").insert(
+        {"user_id": user_id, "event_type": event_type}
+    ).execute()
+
+
 # ── MEALS ─────────────────────────────────────────────────────────────────────
 
 def _meal_type_from_time() -> str:
@@ -53,11 +67,12 @@ def _meal_type_from_time() -> str:
     return "late_snack"
 
 
-def log_meal(user_id: str, description: str):
+def log_meal(user_id: str, description: str, source: str = "photo", meal_type: str | None = None):
     supabase.table("meals").insert({
         "user_id": user_id,
         "description": description[:200],
-        "meal_type": _meal_type_from_time(),
+        "meal_type": meal_type or _meal_type_from_time(),
+        "source": source,
     }).execute()
 
 
@@ -91,6 +106,22 @@ def get_meals_by_date_range(user_id: str, from_date: datetime, to_date: datetime
         .execute()
         .data
     )
+
+
+def update_last_meal_type(user_id: str, meal_type: str):
+    """YOL-31: Update most recent meal's meal_type IF logged within last 60 seconds."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat()
+    result = (
+        supabase.table("meals")
+        .select("id")
+        .eq("user_id", user_id)
+        .gte("logged_at", cutoff)
+        .order("logged_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    if result.data:
+        supabase.table("meals").update({"meal_type": meal_type}).eq("id", result.data[0]["id"]).execute()
 
 
 def get_today_meals(user_id: str) -> list:
@@ -134,6 +165,20 @@ def clear_block(user_id: str):
     supabase.table("off_topic_log").update(
         {"count": 0, "blocked_until": None}
     ).eq("user_id", user_id).execute()
+
+
+def force_block(user_id: str):
+    """Immediately set 6hr block regardless of current count — used by rapid-fire detection."""
+    blocked_until = (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat()
+    result = supabase.table("off_topic_log").select("id").eq("user_id", user_id).execute()
+    if result.data:
+        supabase.table("off_topic_log").update(
+            {"count": 0, "blocked_until": blocked_until}
+        ).eq("user_id", user_id).execute()
+    else:
+        supabase.table("off_topic_log").insert(
+            {"user_id": user_id, "count": 0, "blocked_until": blocked_until}
+        ).execute()
 
 
 def increment_off_topic(user_id: str) -> int:

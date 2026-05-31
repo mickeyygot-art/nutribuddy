@@ -19,7 +19,8 @@ import pytz
 from database import (
     get_or_create_user, update_user_goal, update_user_language,
     log_meal, get_today_meals, get_meals_by_date_range, get_week_meals,
-    is_blocked, clear_block, increment_off_topic, get_all_users,
+    is_blocked, clear_block, force_block, increment_off_topic, get_all_users,
+    update_last_meal_type, update_last_active, log_event, supabase,
 )
 
 app = FastAPI()
@@ -80,11 +81,32 @@ UNBLOCK_KEYWORDS = {
     "start", "restart", "sorry",
 }
 
+# YOL-31: Meal keyword → meal_type mapping (longest keys checked first)
+MEAL_KEYWORDS = [
+    ("late night", "late_snack"),
+    ("อาหารเช้า", "breakfast"), ("มื้อเช้า", "breakfast"),
+    ("อาหารกลางวัน", "lunch"), ("มื้อกลางวัน", "lunch"),
+    ("อาหารเย็น", "dinner"), ("มื้อเย็น", "dinner"),
+    ("กลางวัน", "lunch"), ("เที่ยง", "lunch"),
+    ("เช้า", "breakfast"), ("breakfast", "breakfast"), ("morning", "breakfast"),
+    ("เย็น", "dinner"), ("dinner", "dinner"), ("evening", "dinner"),
+    ("ของว่าง", "snack"), ("สแนค", "snack"), ("snack", "snack"), ("midday", "lunch"),
+    ("ดึก", "late_snack"), ("lunch", "lunch"),
+]
+
 CONVERSATIONAL_WHITELIST = {
     "โอเค", "ok", "okay", "ได้", "ครับ", "ค่ะ", "นะ",
     "yes", "no", "ใช่", "ไม่", "ขอบคุณ", "thanks",
     "บอกไปแล้ว", "บอกแล้ว", "แล้ว", "เข้าใจ",
 }
+
+DASHBOARD_KEYWORDS = {
+    "ดูสรุป", "สรุปของฉัน", "ดูประวัติ", "กินอะไรไปบ้าง", "สถิติ",
+    "my summary", "show summary", "my stats", "dashboard", "my history",
+}
+
+NO_MEALS_DASHBOARD_TH = "ยังไม่มีข้อมูลอาหารใน 7 วันที่ผ่านมาเลยนะ ลองส่งรูปอาหารมาให้ดูได้เลย 🍽️"
+NO_MEALS_DASHBOARD_EN = "No meals logged in the last 7 days yet — try sending a food photo! 🍽️"
 
 GOAL_MAP = {
     "1": "lose_weight",    "ลดน้ำหนัก": "lose_weight",      "lose weight": "lose_weight",
@@ -127,6 +149,11 @@ CONTENT:
 
 # In-memory conversation history: {line_user_id: [{role, content}, ...]} max 10 entries
 conversation_history: dict[str, list] = {}
+
+# YOL-29: Rate limiting — {line_user_id: [datetime, ...]}
+message_timestamps: dict[str, list] = {}
+# YOL-29: Rapid off-topic detection — {user_id: [datetime, ...]}
+off_topic_timestamps: dict[str, list] = {}
 
 
 def is_thai(text: str) -> bool:
@@ -172,6 +199,41 @@ def clean_for_line(text: str) -> str:
     return text.strip()
 
 
+def is_dashboard_request(text: str) -> bool:
+    """YOL-33: Returns True if user is requesting their personal summary."""
+    t = text.lower().strip()
+    return any(kw in t for kw in DASHBOARD_KEYWORDS)
+
+
+def detect_meal_keyword(text: str) -> str | None:
+    """YOL-31: Returns meal_type if a meal-time keyword is found, else None."""
+    t = text.lower()
+    for kw, meal_type in MEAL_KEYWORDS:
+        if kw in t:
+            return meal_type
+    return None
+
+
+def is_rate_limited(line_user_id: str) -> bool:
+    """YOL-29: Returns True if user sent >10 messages in the last 60s. Silently drops if True."""
+    now = datetime.now()
+    cutoff = now - timedelta(seconds=60)
+    ts = message_timestamps.setdefault(line_user_id, [])
+    ts.append(now)
+    message_timestamps[line_user_id] = [t for t in ts if t > cutoff]
+    return len(message_timestamps[line_user_id]) > 10
+
+
+def is_rapid_off_topic(user_id: str) -> bool:
+    """YOL-29: Returns True if 3+ off-topic strikes within 120s (rapid fire batch)."""
+    now = datetime.now()
+    cutoff = now - timedelta(seconds=120)
+    ts = off_topic_timestamps.setdefault(user_id, [])
+    ts.append(now)
+    off_topic_timestamps[user_id] = [t for t in ts if t > cutoff]
+    return len(off_topic_timestamps[user_id]) >= 3
+
+
 def is_unblock_command(text: str) -> bool:
     t = text.lower().strip()
     return any(kw in t for kw in UNBLOCK_KEYWORDS)
@@ -199,16 +261,23 @@ def classify_meal_report(text: str) -> bool:
     return resp.content[0].text.strip().upper() == "MEAL"
 
 
-def extract_dish_from_text(text: str) -> str:
-    """YOL-24: Extract dish name only from a meal report message."""
+def extract_meals_from_text(text: str) -> list:
+    """YOL-32: Extract all meals from a meal report. Returns [{dish, meal_type}, ...]."""
+    import json
     resp = claude.messages.create(
         model="claude-haiku-4-5-20251001",
-        max_tokens=30,
+        max_tokens=200,
         messages=[{"role": "user", "content":
-            f"Extract the dish name only from this message. Reply with just the dish name, nothing else.\n\n"
+            f"Extract all meals mentioned in this message. Return as JSON array only, no explanation.\n"
+            f"Format: [{{\"dish\": \"dish name\", \"meal_type\": \"breakfast|lunch|dinner|snack|late_snack\"}}]\n"
+            f"If meal type not mentioned, omit meal_type key.\n\n"
             f"Message: {text}"}]
     )
-    return resp.content[0].text.strip()[:200]
+    try:
+        result = json.loads(resp.content[0].text.strip())
+        return result if isinstance(result, list) else []
+    except (json.JSONDecodeError, ValueError):
+        return []
 
 
 def classify_off_topic(text: str) -> bool:
@@ -310,12 +379,31 @@ def handle_follow(event):
 def handle_text(event):
     line_user_id = event.source.user_id
     text = event.message.text
+
+    # YOL-29: Rate limit — silently drop if >10 messages/60s
+    if is_rate_limited(line_user_id):
+        return
+
     user = get_or_create_user(line_user_id)
     user_id = user["id"]
     lang = "th" if is_thai(text) else "en"
 
     if user["language"] != lang:
         update_user_language(line_user_id, lang)
+
+    # YOL-35: Track last active timestamp
+    try:
+        update_last_active(user_id)
+    except Exception as e:
+        print(f"last_active update error: {e}")
+
+    # YOL-31: Retroactive meal type correction from follow-up text (silent, no early return)
+    meal_kw = detect_meal_keyword(text)
+    if meal_kw:
+        try:
+            update_last_meal_type(user_id, meal_kw)
+        except Exception as e:
+            print(f"Meal type update error for {user_id}: {e}")
 
     # YOL-21: Input length guard — cap at 500 chars before any Claude call
     if len(text) > 500:
@@ -326,6 +414,10 @@ def handle_text(event):
     currently_blocked = is_blocked(user_id)
     if is_unblock_command(text) and currently_blocked:
         clear_block(user_id)
+        try:
+            log_event(user_id, "unblock")
+        except Exception:
+            pass
         _reply(event.reply_token, UNBLOCK_TH if lang == "th" else UNBLOCK_EN)
         return
 
@@ -344,24 +436,81 @@ def handle_text(event):
         _reply(event.reply_token, msg)
         return
 
+    # YOL-33: In-chat dashboard — always valid, checked before off-topic classifier
+    if is_dashboard_request(text):
+        try:
+            log_event(user_id, "dashboard_requested")
+        except Exception:
+            pass
+        meals_7 = get_week_meals(user_id)
+        if not meals_7:
+            _reply(event.reply_token, NO_MEALS_DASHBOARD_TH if lang == "th" else NO_MEALS_DASHBOARD_EN)
+            return
+        from collections import Counter
+        days = len({m["logged_at"][:10] for m in meals_7})
+        dish_counts = Counter(m["description"] for m in meals_7)
+        top_dishes = ", ".join(d for d, _ in dish_counts.most_common(3))
+        by_type = {}
+        for m in meals_7:
+            by_type.setdefault(m["meal_type"], 0)
+            by_type[m["meal_type"]] += 1
+        missing = [mt for mt in ["breakfast", "lunch", "dinner"] if by_type.get(mt, 0) < 3]
+        goal_label = GOAL_LABEL.get(user["goal"], "no specific goal")
+        lang_word = "Thai" if lang == "th" else "English"
+        prompt = f"""Personal 7-day food summary for a NutriBuddy user.
+Days logged: {days}/7
+Most eaten: {top_dishes}
+Meal types often skipped (< 3 days this week): {', '.join(missing) if missing else 'none'}
+Goal: {goal_label}
+
+Write a short plain-text summary in this format (no labels, no markdown, no bullets):
+Line 1: days logged warm sentence
+Line 2: most eaten dishes
+Line 3: one sentence on missed meal types or eating pattern
+Line 4: one goal-relevant tip 🌿
+
+Rules: max 4 sentences, max 1 emoji at the end, plain text only, reply in {lang_word}."""
+        resp = claude.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=250,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        _reply(event.reply_token, resp.content[0].text)
+        return
+
     # YOL-25: Skip off-topic classifier for short / conversational messages
     if not is_conversational(text) and classify_off_topic(text):
-        count = increment_off_topic(user_id)
-        if count >= 3:
+        # YOL-29: Rapid-fire detection — 3+ strikes within 120s → immediate block
+        if is_rapid_off_topic(user_id):
+            force_block(user_id)
+            try:
+                log_event(user_id, "block_triggered")
+            except Exception:
+                pass
             msg = BLOCKED_TH if lang == "th" else BLOCKED_EN
-        elif count == 2:
-            msg = WARN_2_TH if lang == "th" else WARN_2_EN
         else:
-            msg = OFFTOPIC_TH if lang == "th" else OFFTOPIC_EN
+            count = increment_off_topic(user_id)
+            if count >= 3:
+                try:
+                    log_event(user_id, "block_triggered")
+                except Exception:
+                    pass
+                msg = BLOCKED_TH if lang == "th" else BLOCKED_EN
+            elif count == 2:
+                msg = WARN_2_TH if lang == "th" else WARN_2_EN
+            else:
+                msg = OFFTOPIC_TH if lang == "th" else OFFTOPIC_EN
         _reply(event.reply_token, msg)
         return
 
-    # YOL-24: Silently log meal if user is reporting what they ate in text
+    # YOL-24/32: Silently log all meals reported in text (multi-meal support)
     try:
         if classify_meal_report(text):
-            dish = extract_dish_from_text(text)
-            if dish:
-                log_meal(user_id, dish)
+            for entry in extract_meals_from_text(text):
+                dish = entry.get("dish", "").strip()[:200]
+                meal_type = entry.get("meal_type") or None
+                if dish:
+                    log_meal(user_id, dish, source="text", meal_type=meal_type)
     except Exception as e:
         print(f"Text meal log error for {user_id}: {e}")  # Non-fatal
 
@@ -414,9 +563,20 @@ def handle_text(event):
 @handler.add(MessageEvent, message=ImageMessageContent)
 def handle_image(event):
     line_user_id = event.source.user_id
+
+    # YOL-29: Rate limit
+    if is_rate_limited(line_user_id):
+        return
+
     user = get_or_create_user(line_user_id)
     user_id = user["id"]
     lang = user["language"]
+
+    # YOL-35: Track last active
+    try:
+        update_last_active(user_id)
+    except Exception as e:
+        print(f"last_active update error: {e}")
 
     if is_blocked(user_id):
         _reply(event.reply_token, BLOCKED_TH if lang == "th" else BLOCKED_EN)
@@ -462,7 +622,7 @@ def handle_image(event):
         coaching_text = coaching_text + "\n" + nudge
     else:
         try:
-            log_meal(user_id, dish_name)
+            log_meal(user_id, dish_name, source="photo")
         except Exception as e:
             print(f"Meal log error for {user_id}: {e}")
 
@@ -530,6 +690,10 @@ STRICT FORMATTING — LINE does not render markdown:
                 messages=[{"role": "user", "content": prompt}],
             )
             _push(line_user_id, resp.content[0].text)
+            try:
+                log_event(user["id"], "daily_summary_sent")
+            except Exception:
+                pass
         except Exception as e:
             print(f"Summary error for {user.get('line_user_id')}: {e}")
 
@@ -602,6 +766,10 @@ STRICT FORMATTING — LINE does not render markdown:
                 messages=[{"role": "user", "content": prompt}],
             )
             _push(line_user_id, resp.content[0].text)
+            try:
+                log_event(user["id"], "weekly_summary_sent")
+            except Exception:
+                pass
         except Exception as e:
             print(f"Weekly summary error for {user.get('line_user_id')}: {e}")
 
@@ -629,6 +797,93 @@ def trigger_summary(request: Request):
         raise HTTPException(status_code=403, detail="Forbidden")
     send_daily_summaries()
     return {"status": "sent"}
+
+
+# ── ADMIN DASHBOARD (YOL-36) ──────────────────────────────────────────────────
+
+def _check_admin(request: Request):
+    """Raise 403 if ADMIN_SECRET header or query param doesn't match."""
+    secret = os.environ.get("ADMIN_SECRET", "")
+    provided = (
+        request.headers.get("X-Admin-Secret", "") or
+        request.query_params.get("secret", "")
+    )
+    if not secret or provided != secret:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+
+@app.get("/admin")
+def admin_page(request: Request):
+    from fastapi.responses import FileResponse
+    _check_admin(request)
+    return FileResponse("admin.html")
+
+
+@app.get("/admin/stats")
+def admin_stats(request: Request):
+    _check_admin(request)
+    from datetime import timezone as _tz
+    now = datetime.now(_tz.utc)
+    week_ago = (now - timedelta(days=7)).isoformat()
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+
+    users = supabase.table("users").select("*").execute().data
+    total_users = len(users)
+    new_this_week = sum(1 for u in users if u.get("created_at", "") >= week_ago)
+    active_today = sum(1 for u in users if (u.get("last_active_at") or "") >= today_start)
+    active_this_week = sum(1 for u in users if (u.get("last_active_at") or "") >= week_ago)
+    goal_breakdown = {}
+    never_logged = 0
+    for u in users:
+        goal_breakdown[u.get("goal", "no_goal")] = goal_breakdown.get(u.get("goal", "no_goal"), 0) + 1
+
+    meals_all = supabase.table("meals").select("*").execute().data
+    meals_today = [m for m in meals_all if m.get("logged_at", "") >= today_start]
+    meals_week = [m for m in meals_all if m.get("logged_at", "") >= week_ago]
+    from collections import Counter
+    dish_counts = Counter(m["description"] for m in meals_week)
+    top_dishes = [{"dish": d, "count": c} for d, c in dish_counts.most_common(10)]
+    type_dist = dict(Counter(m["meal_type"] for m in meals_all))
+    text_meals = sum(1 for m in meals_all if m.get("source") == "text")
+    photo_meals = sum(1 for m in meals_all if m.get("source") != "text")
+
+    events = supabase.table("event_log").select("*").gte("created_at", week_ago).execute().data
+    event_counts = dict(Counter(e["event_type"] for e in events))
+
+    active_users_count = max(active_this_week, 1)
+    avg_meals_per_user = round(len(meals_week) / active_users_count, 1)
+    api_cost_estimate = round(len(meals_today) * 0.003, 4)
+
+    return {
+        "users": {
+            "total": total_users,
+            "new_this_week": new_this_week,
+            "active_today": active_today,
+            "active_this_week": active_this_week,
+            "goal_breakdown": goal_breakdown,
+        },
+        "meals": {
+            "today": len(meals_today),
+            "this_week": len(meals_week),
+            "all_time": len(meals_all),
+            "avg_per_active_user_per_day": avg_meals_per_user,
+            "photo_count": photo_meals,
+            "text_count": text_meals,
+            "top_dishes_7d": top_dishes,
+            "type_distribution": type_dist,
+        },
+        "engagement": {
+            "daily_summaries_sent_7d": event_counts.get("daily_summary_sent", 0),
+            "weekly_summaries_sent_7d": event_counts.get("weekly_summary_sent", 0),
+            "dashboard_requests_7d": event_counts.get("dashboard_requested", 0),
+            "blocks_triggered_7d": event_counts.get("block_triggered", 0),
+            "unblocks_7d": event_counts.get("unblock", 0),
+        },
+        "system": {
+            "estimated_api_cost_today_usd": api_cost_estimate,
+            "generated_at": now.isoformat(),
+        },
+    }
 
 
 @app.post("/cron/weekly-summary")
