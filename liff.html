@@ -57,7 +57,6 @@
 
 <div id="error" class="hidden">
   <p>ไม่สามารถโหลดข้อมูลได้ — ลองใหม่อีกครั้ง</p>
-  <p id="errDetail" style="font-size:12px;color:#cbd5e1;margin-top:-8px"></p>
   <button onclick="load()">ลองใหม่</button>
 </div>
 
@@ -127,47 +126,23 @@
       `</div>`).join('');
   }
 
-  async function fail(detail) {
-    let extra = '';
-    try {
-      const token = liff.getAccessToken();
-      if (token) {
-        const w = await fetch('/api/liff/whoami', { headers: { Authorization: `Bearer ${token}` } });
-        if (w.ok) {
-          const j = await w.json();
-          extra = ` | resolved=${j.token_resolved} profile=${j.profile_status} row=${j.row_exists} users=${j.total_users}`;
-        } else {
-          extra = ` | whoami ${w.status}`;
-        }
-      }
-    } catch (_) {}
-    document.getElementById('errDetail').textContent = (detail || '') + extra;
-    show('error');
-  }
-
   async function load() {
     show('loading');
     try {
       const token = liff.getAccessToken();
-      if (!token) { fail('no access token'); return; }
       const res = await fetch('/api/liff/meals', { headers: { Authorization: `Bearer ${token}` } });
-      if (!res.ok) {
-        let detail = '';
-        try { detail = (await res.json()).detail || ''; } catch (_) {}
-        fail(`${res.status}${detail ? ' · ' + detail : ''}`);
-        return;
-      }
+      if (!res.ok) throw new Error('http ' + res.status);
       render(await res.json());
       show('content');
     } catch (e) {
-      fail('network: ' + (e && e.message ? e.message : e));
+      show('error');
     }
   }
 
   liff.init({ liffId: LIFF_ID }).then(() => {
     if (!liff.isLoggedIn()) { liff.login(); return; }
     load();
-  }).catch((e) => fail('liff.init: ' + (e && e.message ? e.message : e)));
+  }).catch(() => show('error'));
 </script>
 </body>
 </html>

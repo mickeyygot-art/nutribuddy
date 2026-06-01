@@ -1030,27 +1030,6 @@ def liff_page():
     return HTMLResponse(html.replace("__LIFF_ID__", os.environ.get("LIFF_ID", "")))
 
 
-@app.get("/api/liff/whoami")
-def liff_whoami(request: Request):
-    """Temporary diagnostic (YOL-50): does the token resolve, and is there a matching row?"""
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing token")
-    uid, profile_status = _line_profile(auth[7:].strip())
-    total = 0
-    try:
-        total = supabase.table("users").select("id", count="exact").execute().count or 0
-    except Exception:
-        pass
-    return {
-        "token_resolved": bool(uid),
-        "profile_status": profile_status,
-        "user_id_prefix": (uid[:10] + "…") if uid else None,
-        "row_exists": (get_liff_summary(uid) is not None) if uid else False,
-        "total_users": total,
-    }
-
-
 @app.get("/api/liff/meals")
 def liff_meals(request: Request):
     """Return the signed-in LIFF user's 7-day meal summary."""
