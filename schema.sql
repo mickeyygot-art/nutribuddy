@@ -12,7 +12,18 @@ CREATE TABLE IF NOT EXISTS users (
   last_suggestion_at TIMESTAMPTZ,    -- YOL-43: when that suggestion was sent
   last_winback_at TIMESTAMPTZ,       -- YOL-51: when the last win-back nudge was sent
   coaching_profile TEXT,             -- YOL-59: compact learned profile (food/behavior, no PII)
-  profile_updated_at TIMESTAMPTZ     -- YOL-59: when the profile was last refreshed
+  profile_updated_at TIMESTAMPTZ,    -- YOL-59: when the profile was last refreshed
+  checkin_pending_at TIMESTAMPTZ     -- YOL-60: when an outcome check-in was last asked (awaiting reply)
+);
+
+-- YOL-60: Outcome check-ins — self-reported wellbeing over time (no PII; weight only if volunteered)
+CREATE TABLE IF NOT EXISTS checkins (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+  energy INTEGER,                    -- self-rated 1-5, nullable
+  goal_progress TEXT,                -- 'better' | 'same' | 'worse' | null
+  weight NUMERIC,                    -- kg, ONLY if the user volunteered it
+  created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS meals (
@@ -55,3 +66,7 @@ CREATE TABLE IF NOT EXISTS event_log (
 -- YOL-59: Persistent coaching profile columns
 -- ALTER TABLE users ADD COLUMN IF NOT EXISTS coaching_profile TEXT;
 -- ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_updated_at TIMESTAMPTZ;
+
+-- YOL-60: Outcome check-in column + table
+-- ALTER TABLE users ADD COLUMN IF NOT EXISTS checkin_pending_at TIMESTAMPTZ;
+-- CREATE TABLE IF NOT EXISTS checkins ( ... );  -- see above

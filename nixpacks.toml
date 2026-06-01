@@ -1,0 +1,5 @@
+# YOL-62: ffmpeg is needed to transcode LINE voice notes (m4a/AAC) to FLAC,
+# which Google Speech-to-Text accepts. aptPkgs appends without overriding the
+# auto-detected Python provider.
+[phases.setup]
+aptPkgs = ["ffmpeg"]

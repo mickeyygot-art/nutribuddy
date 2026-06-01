@@ -827,6 +827,44 @@ def profile_context(profile):
     return ("\n\nWHAT YOU REMEMBER ABOUT THIS USER (use to personalize warmly, never to judge):\n" + profile)
 
 
+def is_checkin_pending(pending_at, now):
+    """Pure mirror of main.is_checkin_pending (YOL-60)."""
+    from datetime import datetime as _dt, timedelta as _td
+    if not pending_at:
+        return False
+    try:
+        ts = _dt.fromisoformat(str(pending_at).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return False
+    return (now - ts) < _td(hours=48)
+
+
+def clamp_energy(e):
+    """Pure mirror of parse_checkin's energy validation (YOL-60)."""
+    return e if isinstance(e, int) and 1 <= e <= 5 else None
+
+
+def test_checkin_pending():
+    print("=== Check-in pending window (YOL-60) ===")
+    from datetime import datetime, timezone, timedelta
+    now = datetime.now(timezone.utc)
+    run("None → not pending", not is_checkin_pending(None, now))
+    run("2h ago → pending", is_checkin_pending((now - timedelta(hours=2)).isoformat(), now))
+    run("47h ago → pending", is_checkin_pending((now - timedelta(hours=47)).isoformat(), now))
+    run("49h ago → expired", not is_checkin_pending((now - timedelta(hours=49)).isoformat(), now))
+    run("malformed → not pending", not is_checkin_pending("nope", now))
+
+
+def test_checkin_energy_clamp():
+    print("=== Check-in energy validation (YOL-60) ===")
+    run("3 → 3", clamp_energy(3) == 3)
+    run("1 and 5 valid", clamp_energy(1) == 1 and clamp_energy(5) == 5)
+    run("0 → None", clamp_energy(0) is None)
+    run("6 → None", clamp_energy(6) is None)
+    run("None → None", clamp_energy(None) is None)
+    run("string → None", clamp_energy("4") is None)
+
+
 def test_profile_staleness():
     print("=== Coaching profile staleness (YOL-59) ===")
     from datetime import datetime, timezone, timedelta
@@ -1023,6 +1061,8 @@ if __name__ == "__main__":
         test_cap_history_date,
         test_transactional_history,
         test_tracking_guard,
+        test_checkin_pending,
+        test_checkin_energy_clamp,
         test_profile_staleness,
         test_profile_context,
         test_streak,

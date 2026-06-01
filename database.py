@@ -138,6 +138,43 @@ def update_user_profile(user_id: str, profile: str):
     }).eq("id", user_id).execute()
 
 
+def set_checkin_pending(user_id: str):
+    """YOL-60: mark that we just asked the outcome check-in (awaiting a reply)."""
+    supabase.table("users").update(
+        {"checkin_pending_at": datetime.now(timezone.utc).isoformat()}
+    ).eq("id", user_id).execute()
+
+
+def clear_checkin_pending(user_id: str):
+    """YOL-60: stop intercepting replies as a check-in answer."""
+    supabase.table("users").update(
+        {"checkin_pending_at": None}
+    ).eq("id", user_id).execute()
+
+
+def insert_checkin(user_id: str, energy, goal_progress, weight):
+    """YOL-60: store one self-reported wellbeing check-in."""
+    supabase.table("checkins").insert({
+        "user_id": user_id,
+        "energy": energy,
+        "goal_progress": goal_progress,
+        "weight": weight,
+    }).execute()
+
+
+def get_recent_checkins(user_id: str, limit: int = 6) -> list:
+    """YOL-60: recent check-ins (newest first) for trend context."""
+    return (
+        supabase.table("checkins")
+        .select("*")
+        .eq("user_id", user_id)
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+        .data
+    )
+
+
 # ── MEALS ─────────────────────────────────────────────────────────────────────
 
 def _meal_type_from_time() -> str:

@@ -1,0 +1,285 @@
+meta:
+  product: NutriBuddy
+  version: 1
+  created: 2026-05-31
+  updated: 2026-05-31
+  owner: LINE Agents Service
+  destinations: [posthog]
+  pii_policy: none
+  # LINE user IDs are opaque platform identifiers — not personally identifiable.
+  # No email, name, or phone is stored anywhere in the system.
+  # PostHog distinct_id = LINE user ID directly.
+  internal_user_policy: exclude_by_id
+  # Maintain a Python set INTERNAL_LINE_USER_IDS in the tracking module.
+  # Guard every posthog.capture() and posthog.identify() call:
+  #   if line_user_id in INTERNAL_LINE_USER_IDS: return
+  # No email-domain filtering is possible (no email stored).
+
+entities:
+  user:
+    id_property: line_user_id
+    id_format: "U[opaque string] — LINE platform ID, e.g. Uxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    posthog_distinct_id: line_user_id
+    traits:
+      - name: goal
+        type: string
+        enum: [lose_weight, eat_clean, build_muscle, no_goal]
+        required: true
+        update_pattern: on_change
+        description: "User's current health goal. Set on onboarding, updated when user changes goal."
+
+      - name: language
+        type: string
+        enum: [th, en]
+        required: true
+        update_pattern: on_change
+        description: "Detected language. th = Thai, en = English. Set on first message, updated if they switch."
+
+      - name: created_at
+        type: datetime
+        required: true
+        update_pattern: once
+        description: "Timestamp of first LINE follow event (when user added the bot)."
+
+      - name: last_active_at
+        type: datetime
+        required: false
+        update_pattern: on_change
+        description: "Timestamp of last message sent by user. Updated on every webhook event."
+
+      - name: meals_logged_count
+        type: integer
+        required: false
+        update_pattern: on_change
+        description: "Running total of meals logged by this user. Increment on each meal.logged event."
+
+      - name: is_internal
+        type: boolean
+        required: false
+        update_pattern: once
+        description: "True for known test/admin users. These users are excluded from all analytics calls — this trait is never actually sent to PostHog."
+
+groups: []
+# NutriBuddy is pure B2C single-player. No accounts, workspaces, or organizations.
+# No group() calls needed. Every event is at the user level.
+
+events:
+
+  # ── LIFECYCLE ──────────────────────────────────────────────────────────────
+
+  - name: user.joined
+    category: lifecycle
+    description: >
+      User adds the NutriBuddy bot on LINE (FollowEvent). This is the
+      entry point of the funnel — equivalent to signup. Fires once per user.
+    properties:
+      # No properties available. LINE FollowEvent provides only the user ID.
+      # Source attribution is not possible at this layer.
+    expected_frequency: low
+    posthog_notes: >
+      Fire posthog.identify() immediately after with created_at, goal='no_goal',
+      language='th' (defaults). Then fire posthog.capture('user.joined').
+
+  - name: goal.set
+    category: lifecycle
+    description: >
+      User sets or changes their health goal. Fires on onboarding goal selection
+      AND on any subsequent goal change via phrase or digit.
+    properties:
+      - name: goal
+        type: string
+        enum: [lose_weight, eat_clean, build_muscle, no_goal]
+        required: true
+        description: "The new goal value."
+
+      - name: previous_goal
+        type: string
+        enum: [lose_weight, eat_clean, build_muscle, no_goal]
+        required: false
+        description: "Previous goal value. Null/absent on first set."
+
+      - name: is_initial_set
+        type: boolean
+        required: true
+        description: "True if this is the first goal set (during onboarding), false if a change."
+
+      - name: set_method
+        type: string
+        enum: [digit_reply, phrase]
+        required: true
+        description: "How the user expressed the goal. digit_reply = sent '1','2','3','4'; phrase = keyword match."
+    expected_frequency: low
+    posthog_notes: >
+      Also call posthog.identify() to update the goal trait so every subsequent
+      event is queryable by goal in PostHog.
+
+  # ── CORE VALUE ─────────────────────────────────────────────────────────────
+
+  - name: meal.logged
+    category: core_value
+    description: >
+      A meal is successfully recorded in the database. This is the PRIMARY VALUE
+      ACTION. If this event's daily count drops to zero, the product has failed.
+      Covers both photo and text input paths.
+    properties:
+      - name: source
+        type: string
+        enum: [photo, text]
+        required: true
+        description: "How the meal was logged — via food photo or text description."
+
+      - name: meal_type
+        type: string
+        enum: [breakfast, lunch, dinner, snack, late_snack]
+        required: false
+        description: >
+          Meal type derived from clock time (photo path) or from triage/keyword
+          extraction (text path). Null if not determinable.
+
+      - name: dish_identified
+        type: boolean
+        required: true
+        description: >
+          True if a dish name was successfully extracted. For photo path: Sonnet
+          returned a DISH: line. For text path: Haiku triage extracted a dish
+          name. False = unknown dish (user was prompted to clarify).
+
+      - name: is_first_meal
+        type: boolean
+        required: true
+        description: >
+          True if this is the user's very first meal log ever. Used to identify
+          the activation moment in the funnel.
+    expected_frequency: high
+    posthog_notes: >
+      This is the retention signal. Use PostHog retention analysis with
+      meal.logged as the 'returning action' to measure D1/D7/D30 retention.
+      Also update meals_logged_count trait on posthog.identify() after logging.
+
+  - name: summary.sent
+    category: core_value
+    description: >
+      Bot pushes a daily or weekly summary to a user. Fires once per user per
+      scheduled run. Captures whether the summary contained real meal data or
+      was a no-meals nudge.
+    properties:
+      - name: summary_type
+        type: string
+        enum: [daily, weekly]
+        required: true
+
+      - name: meals_in_period
+        type: integer
+        required: true
+        description: >
+          Number of meals logged in the summary period (today for daily,
+          last 7 days for weekly). Zero = no-meals nudge path.
+
+      - name: is_nudge
+        type: boolean
+        required: true
+        description: >
+          True if user had zero meals in the period and received a re-engagement
+          nudge instead of a real summary.
+
+      - name: days_logged
+        type: integer
+        required: false
+        description: "For weekly summaries only: number of distinct days with at least one meal logged."
+    expected_frequency: medium
+    posthog_notes: >
+      summary.sent volume = active user count × cadence. Use to measure
+      summary delivery reliability and nudge rate over time.
+
+  - name: dashboard.viewed
+    category: core_value
+    description: >
+      User explicitly requests their in-chat 7-day summary via a dashboard
+      keyword. Measures self-directed engagement with their own data.
+    properties:
+      - name: meals_in_period
+        type: integer
+        required: true
+        description: "Number of meals in the last 7 days at time of request. Zero = no-data reply path."
+
+      - name: had_meals
+        type: boolean
+        required: true
+        description: "False if user had no meals in the period and received the empty-state reply."
+    expected_frequency: low
+
+  # ── MODERATION ─────────────────────────────────────────────────────────────
+  # Moderation events matter for product health: high block rates indicate
+  # bot misuse or confusing UX. Low unblock rates indicate permanent churn.
+
+  - name: user.blocked
+    category: lifecycle
+    description: >
+      User receives a 6-hour block after hitting 3 off-topic strikes (or 3+
+      rapid-fire off-topic messages within 120s). Signals bot misuse or UX
+      confusion (users who don't understand the bot's scope).
+    properties:
+      - name: block_reason
+        type: string
+        enum: [strike_limit, rapid_fire]
+        required: true
+        description: >
+          strike_limit = 3 sequential off-topic messages (standard flow).
+          rapid_fire = 3+ off-topic messages within 120s (YOL-29 fast path).
+    expected_frequency: low
+
+  - name: user.unblocked
+    category: lifecycle
+    description: >
+      User sends an unblock keyword and regains access before the 6-hour
+      window expires. Measures recovery rate after blocking.
+    properties: []
+    expected_frequency: low
+
+snapshot_sync:
+  description: >
+    User traits that reflect current state must be kept fresh via identify()
+    calls, not just set once. The following traits need updates beyond initial set.
+  traits:
+    - entity: user
+      trait: last_active_at
+      trigger: on every incoming webhook message (text or photo)
+      source: "datetime.now(BKK) at time of message receipt"
+
+    - entity: user
+      trait: meals_logged_count
+      trigger: after each successful meal.logged event
+      source: "increment by 1 on each call to log_meal()"
+
+    - entity: user
+      trait: goal
+      trigger: after each goal.set event
+      source: "new goal value from update_user_goal()"
+
+    - entity: user
+      trait: language
+      trigger: after language detection on each message
+      source: "detected language (th|en)"
+
+implementation_notes:
+  posthog_sdk: posthog-python
+  distinct_id_strategy: >
+    Use LINE user ID directly as distinct_id. It is a platform-opaque identifier
+    with no PII. No hashing needed.
+  internal_exclusion: >
+    Define INTERNAL_LINE_USER_IDS as a Python set at module level in the
+    tracking module. Every posthog.capture() and posthog.identify() call must
+    be guarded: if line_user_id in INTERNAL_LINE_USER_IDS: return.
+  call_placement:
+    user.joined: "In handle_follow(), after get_or_create_user()"
+    goal.set: "In handle_text(), after update_user_goal() succeeds"
+    meal.logged: "In handle_text() after log_meal() succeeds; in handle_image() after log_meal() succeeds"
+    summary.sent: "In send_daily_summaries() and send_weekly_summaries() after _push() succeeds"
+    dashboard.viewed: "In handle_text() dashboard branch, after the Claude reply"
+    user.blocked: "In handle_text() at each block_triggered point"
+    user.unblocked: "In handle_text() after clear_block() succeeds"
+  first_meal_detection: >
+    Determine is_first_meal by checking if meals_logged_count trait == 0 before
+    logging (or query the meals table: SELECT COUNT(*) WHERE user_id = ? and compare).
+    The simplest approach: add a helper is_first_meal(user_id) that queries
+    Supabase for count of prior meals.

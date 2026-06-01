@@ -14,7 +14,7 @@ from linebot.v3.messaging import (
     ReplyMessageRequest, PushMessageRequest, TextMessage,
 )
 from linebot.v3.webhooks import (
-    MessageEvent, TextMessageContent, ImageMessageContent, FollowEvent,
+    MessageEvent, TextMessageContent, ImageMessageContent, AudioMessageContent, FollowEvent,
 )
 from linebot.v3.exceptions import InvalidSignatureError
 import anthropic
@@ -29,7 +29,10 @@ from database import (
     update_user_suggestion, clear_user_suggestion, get_liff_summary,
     get_lapsed_users, mark_winback_sent, get_meal_count, get_meal_dates,
     compute_streak, bkk_date_key, get_recent_meals, update_user_profile,
+    set_checkin_pending, clear_checkin_pending, insert_checkin, get_recent_checkins,
 )
+import subprocess
+import tempfile
 import tracking
 
 
@@ -101,6 +104,16 @@ DAILY_NO_MEALS_EN = "Nothing logged today — still time to catch dinner tonight
 # YOL-51: win-back nudge (warm, no guilt)
 WINBACK_TH = "คิดถึงนะ 🌿 ไม่ได้คุยกันสองสามวันเลย — วันนี้กินอะไรอร่อยๆ บ้าง? ส่งรูปมาให้ NutriBuddy ดูได้เลย"
 WINBACK_EN = "Missed you 🌿 It's been a few days — what'd you eat today? Send me a photo anytime."
+
+# YOL-60: opt-in weekly outcome check-in (appended after the Monday summary)
+CHECKIN_PROMPT_TH = "อีกนิดนะ 🌿 อาทิตย์นี้รู้สึกยังไงบ้าง? พลังงานเป็นไง (1-5) และรู้สึกเข้าใกล้เป้าหมายขึ้นไหม? ตอบสั้นๆ หรือข้ามก็ได้นะ"
+CHECKIN_PROMPT_EN = "One more thing 🌿 How are you feeling this week? Energy (1-5), and do you feel closer to your goal? A short reply or skip — totally up to you."
+CHECKIN_THANKS_TH = "ขอบคุณที่เล่าให้ฟังนะ 🌿"
+CHECKIN_THANKS_EN = "Thanks for sharing that 🌿"
+
+# YOL-62: voice fallback when transcription is unavailable
+VOICE_FALLBACK_TH = "ขอโทษนะ ตอนนี้ยังฟังเสียงไม่ค่อยชัด — พิมพ์ชื่อเมนูหรือส่งรูปอาหารมาได้เลย 🍽️"
+VOICE_FALLBACK_EN = "Sorry, I couldn't catch that voice note — type the dish name or send a photo instead 🍽️"
 
 # YOL-52/53: milestone copy (templated — no Claude call). {n} = the milestone number.
 MILESTONE_VOLUME_TH = {
@@ -211,6 +224,8 @@ conversation_history: dict[str, list] = {}
 message_timestamps: dict[str, list] = {}
 # YOL-29: Rapid off-topic detection — {user_id: [datetime, ...]}
 off_topic_timestamps: dict[str, list] = {}
+# YOL-61: proactive pattern-spotting — once/day per user {line_user_id: 'YYYY-MM-DD'}
+pattern_spot_day: dict[str, str] = {}
 
 
 def is_thai(text: str) -> bool:
@@ -586,6 +601,60 @@ def maybe_update_profile(user: dict, line_user_id: str):
         print(f"Profile update error for {user.get('id')}: {e}")
 
 
+def is_checkin_pending(pending_at, now) -> bool:
+    """YOL-60: True if a check-in was asked within the last 48h (awaiting a reply)."""
+    if not pending_at:
+        return False
+    try:
+        ts = datetime.fromisoformat(str(pending_at).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return False
+    return (now - ts) < timedelta(hours=48)
+
+
+def parse_checkin(text: str) -> dict:
+    """YOL-60: extract {is_checkin, energy(1-5|None), goal_progress, weight} from a reply."""
+    SAFE = {"is_checkin": False, "energy": None, "goal_progress": None, "weight": None}
+    try:
+        resp = claude.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=60,
+            messages=[{"role": "user", "content":
+                "A health bot asked the user how they're feeling this week (energy + goal progress). "
+                "Parse their reply into JSON only:\n"
+                '{"is_checkin": true/false, "energy": 1-5 or null, "goal_progress": "better|same|worse" or null, "weight": number-in-kg or null}\n'
+                "is_checkin = false if they ignored it / asked something unrelated. "
+                "weight only if explicitly stated. Reply with ONLY the JSON.\n\n"
+                f"Reply: {text}"}],
+        )
+        import json as _json
+        s = resp.content[0].text.strip()
+        a, b = s.find("{"), s.rfind("}")
+        if a == -1 or b == -1:
+            return dict(SAFE)
+        data = _json.loads(s[a:b + 1])
+        e = data.get("energy")
+        e = e if isinstance(e, int) and 1 <= e <= 5 else None
+        return {
+            "is_checkin": bool(data.get("is_checkin")),
+            "energy": e,
+            "goal_progress": data.get("goal_progress") if data.get("goal_progress") in ("better", "same", "worse") else None,
+            "weight": data.get("weight") if isinstance(data.get("weight"), (int, float)) else None,
+        }
+    except Exception as e:
+        print(f"parse_checkin error: {e}")
+        return dict(SAFE)
+
+
+def pattern_spot_allowed(line_user_id: str) -> bool:
+    """YOL-61: allow a proactive pattern observation at most once per BKK day per user."""
+    today = datetime.now(BKK).date().isoformat()
+    if pattern_spot_day.get(line_user_id) == today:
+        return False
+    pattern_spot_day[line_user_id] = today
+    return True
+
+
 def check_milestone(user_id: str, lang: str, is_first_today: bool) -> str | None:
     """YOL-52/53: return a templated milestone celebration, or None. Volume milestones
     fire on any qualifying log; streak milestones only on the first meal of the day."""
@@ -615,6 +684,52 @@ def _push(line_user_id: str, text: str):
         MessagingApi(api_client).push_message(
             PushMessageRequest(to=line_user_id, messages=[TextMessage(text=clean_for_line(text))])
         )
+
+
+def transcribe_audio(audio_bytes: bytes, duration_ms: int = 0) -> str | None:
+    """YOL-62: transcribe a LINE voice note (m4a) via Google Speech-to-Text.
+    Transcodes m4a→FLAC with ffmpeg first (Google STT doesn't accept AAC). Returns
+    None if GOOGLE_API_KEY is unset, audio is too long, or anything fails (graceful)."""
+    key = os.environ.get("GOOGLE_API_KEY", "")
+    if not key:
+        return None
+    if duration_ms and duration_ms > 60000:  # cap at 60s — guardrail
+        return None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".m4a") as src, \
+             tempfile.NamedTemporaryFile(suffix=".flac") as dst:
+            src.write(audio_bytes)
+            src.flush()
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", src.name, "-ac", "1", "-ar", "16000", dst.name],
+                check=True, capture_output=True, timeout=30,
+            )
+            with open(dst.name, "rb") as f:
+                flac = f.read()
+        body = json.dumps({
+            "config": {
+                "encoding": "FLAC",
+                "sampleRateHertz": 16000,
+                "languageCode": "th-TH",
+                "alternativeLanguageCodes": ["en-US"],
+            },
+            "audio": {"content": base64.b64encode(flac).decode("utf-8")},
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            f"https://speech.googleapis.com/v1/speech:recognize?key={key}",
+            data=body, headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        parts = [
+            x["alternatives"][0]["transcript"]
+            for x in data.get("results", []) if x.get("alternatives")
+        ]
+        text = " ".join(parts).strip()
+        return text or None
+    except Exception as e:
+        print(f"Transcription error: {e}")
+        return None
 
 
 # ── WEBHOOK ───────────────────────────────────────────────────────────────────
@@ -656,24 +771,29 @@ def handle_follow(event):
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_text(event):
     line_user_id = event.source.user_id
-    text = event.message.text
 
     # YOL-29: Rate limit — silently drop if >10 messages/60s
     if is_rate_limited(line_user_id):
         return
 
     user = get_or_create_user(line_user_id)
+    try:
+        update_last_active(user["id"])  # YOL-35
+    except Exception as e:
+        print(f"last_active update error: {e}")
+
+    process_text(event, user, event.message.text)
+
+
+def process_text(event, user: dict, text: str):
+    """Shared text pipeline — reused by handle_text and voice transcripts (YOL-62)."""
+    line_user_id = user["line_user_id"]
     user_id = user["id"]
     lang = "th" if is_thai(text) else "en"
 
     if user["language"] != lang:
         update_user_language(line_user_id, lang)
-
-    # YOL-35: Track last active timestamp
-    try:
-        update_last_active(user_id)
-    except Exception as e:
-        print(f"last_active update error: {e}")
+        user["language"] = lang
 
     # YOL-21: Input length guard — cap at 500 chars before any Claude call
     if len(text) > 500:
@@ -695,6 +815,24 @@ def handle_text(event):
     if currently_blocked:
         _reply(event.reply_token, BLOCKED_TH if lang == "th" else BLOCKED_EN)
         return
+
+    # YOL-60: capture an outcome check-in reply (before goal detection, since a bare
+    # energy digit like "4" would otherwise be misread as a goal selection).
+    if is_checkin_pending(user.get("checkin_pending_at"), datetime.now(timezone.utc)):
+        parsed = parse_checkin(text)
+        try:
+            clear_checkin_pending(user_id)
+        except Exception:
+            pass
+        if parsed["is_checkin"]:
+            try:
+                insert_checkin(user_id, parsed["energy"], parsed["goal_progress"], parsed["weight"])
+                log_event(user_id, "checkin_completed")
+            except Exception as e:
+                print(f"checkin store error for {user_id}: {e}")
+            _reply(event.reply_token, CHECKIN_THANKS_TH if lang == "th" else CHECKIN_THANKS_EN)
+            return
+        # not a check-in answer → fall through to normal handling
 
     # Goal change?
     goal = detect_goal(text)
@@ -852,6 +990,19 @@ Rules: max 4 sentences, max 1 emoji at the end, plain text only, reply in {lang_
     if meal_context_parts:
         system += "\n\nMEAL CONTEXT (use this when answering questions about what was eaten):\n" + "\n".join(meal_context_parts)
 
+    # YOL-61: proactive pattern-spotting on a meal log — folded into this same reply,
+    # capped once/day per user. Default is silence; only speak up if truly noteworthy.
+    if logged_dishes and pattern_spot_allowed(line_user_id):
+        try:
+            recent_list = ", ".join(m["description"] for m in get_recent_meals(user_id, 6))
+            system += ("\n\nRECENT MEALS (newest first): " + recent_list +
+                       "\nIf AND ONLY IF you notice a genuinely noteworthy short-term pattern "
+                       "(several similar meals in a row, a run of goal-fit choices, or a sudden shift), "
+                       "add ONE warm, forward-looking observation or offer (e.g. 'want a lighter dinner idea?'). "
+                       "Otherwise don't mention patterns at all. Never shame.")
+        except Exception as e:
+            print(f"Pattern-spot context error for {user_id}: {e}")
+
     # YOL-19: Call Claude with prior history + this turn, then commit BOTH turns only on
     # success — appending the user turn before the call corrupts history if the call throws.
     history = conversation_history.setdefault(line_user_id, [])
@@ -965,6 +1116,45 @@ def handle_image(event):
 
     if dish_name:
         maybe_update_profile(user, line_user_id)  # YOL-59: refresh if stale
+
+
+# ── AUDIO / VOICE (YOL-62) ────────────────────────────────────────────────────
+
+@handler.add(MessageEvent, message=AudioMessageContent)
+def handle_audio(event):
+    line_user_id = event.source.user_id
+
+    # YOL-29: rate limit
+    if is_rate_limited(line_user_id):
+        return
+
+    user = get_or_create_user(line_user_id)
+    try:
+        update_last_active(user["id"])  # YOL-35
+    except Exception as e:
+        print(f"last_active update error: {e}")
+    lang = user.get("language", "th")
+
+    if is_blocked(user["id"]):
+        _reply(event.reply_token, BLOCKED_TH if lang == "th" else BLOCKED_EN)
+        return
+
+    # Download the voice note (m4a), transcribe, then reuse the text pipeline.
+    try:
+        with ApiClient(configuration) as api_client:
+            audio_bytes = MessagingApiBlob(api_client).get_message_content(message_id=event.message.id)
+    except Exception as e:
+        print(f"Audio download error for {user['id']}: {e}")
+        _reply(event.reply_token, VOICE_FALLBACK_TH if lang == "th" else VOICE_FALLBACK_EN)
+        return
+
+    duration = getattr(event.message, "duration", 0) or 0
+    transcript = transcribe_audio(audio_bytes, duration)  # raw audio discarded after this
+    if not transcript:
+        _reply(event.reply_token, VOICE_FALLBACK_TH if lang == "th" else VOICE_FALLBACK_EN)
+        return
+
+    process_text(event, user, transcript)  # YOL-62: route through the existing text path
 
 
 # ── DAILY SUMMARY ─────────────────────────────────────────────────────────────
@@ -1133,6 +1323,13 @@ Do NOT list the dishes yourself. Plain text only, no markdown. Reply in {lang_wo
                 log_event(user["id"], "weekly_summary_sent")
             except Exception:
                 pass
+
+            # YOL-60: opt-in outcome check-in (gentle, optional — only for engaged users)
+            try:
+                _push(line_user_id, CHECKIN_PROMPT_TH if lang == "th" else CHECKIN_PROMPT_EN)
+                set_checkin_pending(user["id"])
+            except Exception as e:
+                print(f"Check-in prompt error for {user['id']}: {e}")
         except Exception as e:
             print(f"Weekly summary error for {user.get('line_user_id')}: {e}")
 
@@ -1311,6 +1508,13 @@ def admin_stats(request: Request):
     events = supabase.table("event_log").select("*").gte("created_at", week_ago).execute().data
     event_counts = dict(Counter(e["event_type"] for e in events))
 
+    # YOL-60: outcome signal (the north-star proxy) — last 30 days of check-ins
+    month_ago = (now - timedelta(days=30)).isoformat()
+    checkins = supabase.table("checkins").select("*").gte("created_at", month_ago).execute().data
+    energies = [c["energy"] for c in checkins if isinstance(c.get("energy"), (int, float))]
+    avg_energy = round(sum(energies) / len(energies), 1) if energies else None
+    progress_dist = dict(Counter(c["goal_progress"] for c in checkins if c.get("goal_progress")))
+
     active_users_count = max(active_this_week, 1)
     avg_meals_per_user = round(len(meals_week) / active_users_count, 1)
     api_cost_estimate = round(len(meals_today) * 0.003, 4)
@@ -1340,6 +1544,13 @@ def admin_stats(request: Request):
             "dashboard_requests_7d": event_counts.get("dashboard_requested", 0),
             "blocks_triggered_7d": event_counts.get("block_triggered", 0),
             "unblocks_7d": event_counts.get("unblock", 0),
+            "winback_sent_7d": event_counts.get("winback_sent", 0),
+            "checkins_completed_7d": event_counts.get("checkin_completed", 0),
+        },
+        "outcomes": {
+            "checkins_30d": len(checkins),
+            "avg_energy_30d": avg_energy,
+            "goal_progress_dist_30d": progress_dist,
         },
         "system": {
             "estimated_api_cost_today_usd": api_cost_estimate,
