@@ -1,4 +1,5 @@
 import os
+import re
 import base64
 import time
 from contextlib import asynccontextmanager
@@ -19,7 +20,7 @@ import pytz
 
 from database import (
     get_or_create_user, update_user_goal, update_user_language,
-    log_meal, get_today_meals, get_meals_by_date_range, get_week_meals,
+    log_meal, get_today_meals, get_meals_by_date_range, get_week_meals, get_week_top_dishes,
     is_blocked, clear_block, force_block, increment_off_topic, get_all_users,
     update_last_meal_type, update_last_active, log_event, supabase,
     update_user_suggestion, clear_user_suggestion,
@@ -84,18 +85,13 @@ UNBLOCK_EN = "Welcome back! Send me a food photo anytime 🍽️"
 UNKNOWN_DISH_TH = "(ไม่แน่ใจชื่อเมนูนี้ — ช่วยบอกชื่อด้วยได้มั้ย?)"
 UNKNOWN_DISH_EN = "(Not sure what this dish is — could you tell me the name?)"
 
-WEEKLY_NO_MEALS_TH = "สัปดาห์นี้ยังไม่ได้ส่งรูปอาหารมาเลยนะ — สัปดาห์หน้าลองเริ่มด้วยมื้อเดียวก็ได้ 🍽️"
-WEEKLY_NO_MEALS_EN = "No meals logged this week — next week, try starting with just one photo 🍽️"
+# YOL-49: weekly no-meals fallback (no Claude call)
+WEEKLY_NO_MEALS_TH = "สัปดาห์ที่ผ่านมายังไม่มีบันทึกเลยนะ — สัปดาห์นี้ลองส่งรูปอาหารมาให้ดูได้เลย 🍽️"
+WEEKLY_NO_MEALS_EN = "No meals logged last week — try sending a food photo this week 🍽️"
 
-# YOL-43: Daily summary — no-meals fallback (Message 1 only, no Claude call)
+# YOL-48: daily no-meals fallback (no Claude call)
 DAILY_NO_MEALS_TH = "วันนี้ยังไม่มีมื้อไหนเลยนะ — ไม่เป็นไร คืนนี้ยังทัน 🌿"
 DAILY_NO_MEALS_EN = "Nothing logged today — still time to catch dinner tonight 🌿"
-
-# YOL-43: Thai labels for meal types in the daily recap
-MEAL_TYPE_TH = {
-    "breakfast": "เช้า", "lunch": "กลางวัน", "dinner": "เย็น",
-    "snack": "ของว่าง", "late_snack": "มื้อดึก",
-}
 
 UNBLOCK_KEYWORDS = {
     "เริ่มใหม่", "ขอโทษ", "ยกเลิก", "unblock",
@@ -358,17 +354,80 @@ def build_meal_history_context(meals: list, date_str: str) -> str:
     return f"Meal history for {date_str}: {parts}"
 
 
-def build_daily_recap(meals: list, lang: str) -> str:
-    """YOL-43: Message 1 — factual recap of today's meals, no judgment, no Claude call."""
-    parts = []
-    for m in meals:
-        mtype = m.get("meal_type", "")
-        label = MEAL_TYPE_TH.get(mtype, mtype) if lang == "th" else mtype
-        parts.append(f"{m['description']} ({label})" if label else m["description"])
-    joined = ", ".join(parts)
-    if lang == "th":
-        return f"วันนี้คุณกิน: {joined} 🍽️"
-    return f"Today you had: {joined} 🍽️"
+# YOL-48/49: sentence-completeness so we never send a truncated, mid-sentence message.
+_EMOJI_RE = re.compile(
+    "[\U00002600-\U000027BF\U0001F300-\U0001F9FF\U0001FA00-\U0001FAFF"
+    "\U00002702-\U000027B0\U0000FE00-\U0000FE0F\U0001F1E0-\U0001F1FF]"
+)
+_THAI_ENDINGS = ("นะคะ", "นะครับ", "นะ", "ครับ", "ค่ะ", "ค่า", "จ้ะ", "จ้า", "เลย", "น่ะ")
+
+
+def ends_complete(text: str) -> bool:
+    """True if text ends on a sentence boundary (punctuation, emoji, or Thai particle)."""
+    s = (text or "").rstrip()
+    if not s:
+        return False
+    if s[-1] in ".!?…":
+        return True
+    if _EMOJI_RE.match(s[-1]):
+        return True
+    return any(s.endswith(p) for p in _THAI_ENDINGS)
+
+
+def trim_to_complete(text: str) -> str:
+    """Return text truncated to its last complete sentence boundary. '' if none found."""
+    s = (text or "").rstrip()
+    if ends_complete(s):
+        return s
+    best = -1
+    for i, ch in enumerate(s):
+        if ch in ".!?…" or _EMOJI_RE.match(ch):
+            best = i
+    for p in _THAI_ENDINGS:
+        idx = s.rfind(p)
+        if idx != -1:
+            best = max(best, idx + len(p) - 1)
+    return s[:best + 1].rstrip() if best > 0 else ""
+
+
+def split_opener_narrative(raw: str):
+    """Split a '===' separated model reply into (opener, narrative).
+    Falls back to (None, whole) if the separator is missing."""
+    if "===" in raw:
+        a, _, b = raw.partition("===")
+        return a.strip() or None, b.strip()
+    return None, raw.strip()
+
+
+def build_meal_list(dishes: list, lang: str, weekly: bool = False) -> str:
+    """Deterministic, hallucination-proof recap list (built in Python, not by Claude)."""
+    lines = []
+    for i, d in enumerate(dishes, 1):
+        if weekly:
+            lines.append(f"อันดับ {i}: {d}" if lang == "th" else f"#{i}: {d}")
+        else:
+            lines.append(f"มื้อที่ {i}: {d}" if lang == "th" else f"Meal {i}: {d}")
+    return "\n".join(lines)
+
+
+def complete_narrative(text: str, lang: str) -> str:
+    """YOL-48/49: ensure the narrative is a whole thought — never truncated mid-sentence.
+    One continuation call if cut off; otherwise trim to the last complete sentence."""
+    if ends_complete(text):
+        return text.strip()
+    try:
+        cont = claude.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=100,
+            messages=[{"role": "user", "content":
+                "This message was cut off mid-sentence. Write ONLY the few words needed to finish "
+                f"the final sentence naturally — nothing else, no repetition.\n\n{text}"}],
+        )
+        combined = f"{text.rstrip()} {cont.content[0].text.strip()}"
+    except Exception as e:
+        print(f"narrative continuation error: {e}")
+        combined = text
+    return trim_to_complete(combined) or combined.strip()
 
 
 def is_suggestion_fresh(last_at_iso, now) -> bool:
@@ -776,67 +835,64 @@ def handle_image(event):
 # ── DAILY SUMMARY ─────────────────────────────────────────────────────────────
 
 def send_daily_summaries():
-    # PLAN (YOL-43): 2-message split.
-    #   Message 1 — factual recap (no Claude call).
-    #   Message 2 — one goal-specific coaching move (Sonnet), saved as last_suggestion.
-    #   No meals → Message 1 fallback only, no Message 2, no Claude call.
+    # PLAN (YOL-48): structured meal list + narrative suggestion in one complete message.
+    #   No meals → fixed fallback, no Claude call.
+    #   Meals → opener + chronological dish list (built in Python) + narrative suggestion.
+    #   Narrative guaranteed complete (never mid-sentence). Suggestion stored for YOL-44.
     for user in get_all_users():
         try:
-            meals = get_today_meals(user["id"])
+            meals = get_today_meals(user["id"])  # ordered by logged_at
             lang = user["language"]
             line_user_id = user["line_user_id"]
 
-            # Message 1 — recap
             if not meals:
                 _push(line_user_id, DAILY_NO_MEALS_TH if lang == "th" else DAILY_NO_MEALS_EN)
                 continue
-            _push(line_user_id, build_daily_recap(meals, lang))
 
-            # Message 2 — one coaching move
-            by_type = {}
-            for m in meals:
-                by_type.setdefault(m["meal_type"], []).append(m["description"])
-            meal_lines = ", ".join(
-                f"{', '.join(dishes)} ({mtype})" for mtype, dishes in by_type.items()
-            )
+            n = len(meals)
+            dishes = [m["description"] for m in meals][:5]  # show max 5
             goal = user.get("goal", "no_goal")
             goal_label = GOAL_LABEL.get(goal, "no specific goal")
             last_suggestion = user.get("last_suggestion") or "none"
+            lang_word = "Thai" if lang == "th" else "English"
 
-            coaching_focus = {
-                "lose_weight":  "Suggest one lower-cal swap or smaller portion for a specific meal tomorrow.",
-                "eat_clean":    "Suggest one vegetable to add or one processed item to reduce — name it specifically.",
-                "build_muscle": "Suggest one protein source to add tomorrow — name the dish.",
-                "no_goal":      "Suggest one positive habit: hydration, color variety, or meal timing.",
-            }.get(goal, "Suggest one specific, practical habit for tomorrow.")
+            focus = {
+                "lose_weight":  "Name a specific lower-cal swap to try tomorrow.",
+                "eat_clean":    "Name a specific vegetable to add tomorrow.",
+                "build_muscle": "Name a specific protein source to add tomorrow.",
+                "no_goal":      "Note a positive pattern and suggest one simple habit.",
+            }.get(goal, "Suggest one specific, practical thing for tomorrow.")
 
-            prompt = f"""User ate today: {meal_lines}
+            prompt = f"""User logged {n} meal(s) today. Dishes: {', '.join(dishes)}.
 User goal: {goal_label}
+User language: {lang_word}
 Yesterday's suggestion (if any): {last_suggestion}
 
-{coaching_focus}
+Write TWO parts separated by a line containing only ===
+Part A: a warm opener, 1 sentence, mentions they logged {n} meal(s), ends with 1 emoji.
+Part B: 2-3 sentences. Observe a pattern from today's dishes, connect to their goal, then give ONE specific actionable suggestion for tomorrow — name a real dish or ingredient. {focus} Do not repeat yesterday's suggestion. End with 1 emoji.
 
-Write ONE coaching move for tomorrow. Rules:
-- 1-2 sentences max
-- Name a specific dish or ingredient, not a vague category
-- Don't repeat yesterday's suggestion if shown above
-- Warm friend tone, no lecturing
-- Reply in {"Thai" if lang == "th" else "English"}
-- End with exactly 1 emoji
-- Do NOT mention calories or numbers
-- Plain text only, no markdown"""
+Tone: data-light storyteller, warm friend, no numbers, no calories, no lecturing.
+Do NOT list the meals yourself. Plain text only, no markdown. Reply in {lang_word}."""
 
             resp = claude.messages.create(
                 model="claude-sonnet-4-6",
-                max_tokens=120,
+                max_tokens=200,
                 messages=[{"role": "user", "content": prompt}],
             )
-            move = resp.content[0].text
-            _push(line_user_id, move)
+            opener, narrative = split_opener_narrative(resp.content[0].text)
+            narrative = complete_narrative(narrative, lang)
+            if not opener or not ends_complete(opener):
+                opener = (f"วันนี้คุณบันทึกมา {n} มื้อนะ 🍽️" if lang == "th"
+                          else f"You logged {n} meal(s) today 🍽️")
 
-            # YOL-43: store the move for follow-through detection (YOL-44)
+            list_block = build_meal_list(dishes, lang, weekly=False)
+            message = f"{opener}\n\n{list_block}\n\n{narrative}"
+            _push(line_user_id, message)
+
+            # YOL-44: store ONLY the narrative (not the recap list) for follow-through
             try:
-                update_user_suggestion(user["id"], clean_for_line(move))
+                update_user_suggestion(user["id"], clean_for_line(narrative))
             except Exception as e:
                 print(f"update_user_suggestion error for {user['id']}: {e}")
 
@@ -851,11 +907,10 @@ Write ONE coaching move for tomorrow. Rules:
 # ── WEEKLY SUMMARY (Monday 08:00 Bangkok = Monday 01:00 UTC) ──────────────────
 
 def send_weekly_summaries():
-    # PLAN (YOL-27):
-    # 1. 0 meals → re-engagement, no Claude call
-    # 2. 1-2 days → warm low-logging prefix injected into prompt
-    # 3. Otherwise → full 4-part structured prompt with goal-specific guidance
-    from collections import Counter
+    # PLAN (YOL-49): days logged + top-3 dishes (built in Python) + narrative reflection.
+    #   No meals → fixed fallback, no Claude call.
+    #   Opener tone scales with days logged (5-7 celebratory, 3-4 encouraging, 1-2 gentle).
+    #   Narrative guaranteed complete (never mid-sentence).
     for user in get_all_users():
         try:
             meals = get_week_meals(user["id"])
@@ -863,59 +918,52 @@ def send_weekly_summaries():
             line_user_id = user["line_user_id"]
 
             if not meals:
-                msg = WEEKLY_NO_MEALS_TH if lang == "th" else WEEKLY_NO_MEALS_EN
-                _push(line_user_id, msg)
+                _push(line_user_id, WEEKLY_NO_MEALS_TH if lang == "th" else WEEKLY_NO_MEALS_EN)
                 continue
 
-            days_with_meals = len({m["logged_at"][:10] for m in meals})
-            dish_counts = Counter(m["description"] for m in meals)
-            top_dishes = ", ".join(d for d, _ in dish_counts.most_common(3))
+            days = len({m["logged_at"][:10] for m in meals})
+            top_dishes = get_week_top_dishes(user["id"], 3)
             goal = user.get("goal", "no_goal")
             goal_label = GOAL_LABEL.get(goal, "no specific goal")
             lang_word = "Thai" if lang == "th" else "English"
 
-            # Goal-specific guidance for Part 3 (observation) and Part 4 (tip)
-            goal_guidance = {
-                "lose_weight":  "Part 3: note balance of fried vs lighter meals. Part 4: suggest a lower-cal swap or smaller portion.",
-                "eat_clean":    "Part 3: note vegetable frequency this week. Part 4: suggest adding vegetables or reducing processed food.",
-                "build_muscle": "Part 3: note protein consistency across the week. Part 4: suggest a protein source to add next week.",
-                "no_goal":      "Part 3: give a general positive observation about variety or habits. Part 4: suggest a general positive habit (hydration, color variety, etc.).",
-            }.get(goal, "Part 3: general positive observation. Part 4: practical eating habit suggestion.")
+            tone = ("celebratory" if days >= 5 else
+                    "warm and encouraging" if days >= 3 else
+                    "gentle, no guilt")
+            focus = {
+                "lose_weight":  "Spot a weekly pattern and name one swap to try.",
+                "eat_clean":    "Celebrate any clean choices and name one vegetable to add this week.",
+                "build_muscle": "Note protein consistency and name one dish to add more of.",
+                "no_goal":      "Celebrate consistency and suggest one simple habit for the week.",
+            }.get(goal, "Suggest one specific thing to try this week.")
 
-            # Warm prefix for low-logging weeks (1-2 days)
-            low_log_note = ""
-            if days_with_meals <= 2:
-                low_log_note = (
-                    f"Note: user only logged {days_with_meals} day(s) this week. "
-                    "Frame Part 1 warmly as a good start, not a failure. "
-                    f"TH prefix example: 'สัปดาห์นี้เริ่มบันทึกแล้ว {days_with_meals} วัน — ดีมากที่เริ่มต้น!'"
-                )
+            prompt = f"""User logged meals on {days} of 7 days this week.
+Top dishes (by frequency): {', '.join(top_dishes)}.
+User goal: {goal_label}
+User language: {lang_word}
 
-            prompt = f"""Weekly summary for a NutriBuddy user.
-Goal: {goal_label}
-Days logged this week: {days_with_meals}/7
-Most eaten dishes: {top_dishes}
-{low_log_note}
+Write TWO parts separated by a line containing only ===
+Part A: a warm opener, 1 sentence, mentions they logged {days} of 7 days, ends with 1 emoji. Tone: {tone}.
+Part B: 2-3 sentences. Observe a weekly eating pattern, call out one positive thing, then give ONE specific suggestion for the coming week — name a real dish or ingredient. {focus} End with 1 emoji.
 
-Write exactly 4 sentences — one per part, in order:
-Part 1 — Days logged: warm sentence noting they logged {days_with_meals} out of 7 days (frame as progress).
-Part 2 — What they ate most: one sentence naming the top dishes ({top_dishes}).
-Part 3 — Goal observation: {goal_guidance.split("Part 3:")[1].split(".")[0].strip()}
-Part 4 — One focus tip for this week: {goal_guidance.split("Part 4:")[1].strip()} This part must always be included.
-
-STRICT FORMATTING — LINE does not render markdown:
-- NEVER use **, *, __, _, #, or any markdown symbols
-- NEVER use bullet points or numbered lists
-- Plain text only, like an SMS message
-- Max 1 emoji total, placed at the end of the last sentence only
-- Warm friend tone, reply in {lang_word}"""
+Tone: data-light storyteller, warm friend, no numbers, no calories, no lecturing.
+Do NOT list the dishes yourself. Plain text only, no markdown. Reply in {lang_word}."""
 
             resp = claude.messages.create(
                 model="claude-sonnet-4-6",
-                max_tokens=280,
+                max_tokens=300,
                 messages=[{"role": "user", "content": prompt}],
             )
-            _push(line_user_id, resp.content[0].text)
+            opener, narrative = split_opener_narrative(resp.content[0].text)
+            narrative = complete_narrative(narrative, lang)
+            if not opener or not ends_complete(opener):
+                opener = (f"สัปดาห์นี้คุณบันทึก {days} จาก 7 วัน 🌿" if lang == "th"
+                          else f"You logged {days} of 7 days this week 🌿")
+
+            list_block = build_meal_list(top_dishes, lang, weekly=True)
+            message = f"{opener}\n\n{list_block}\n\n{narrative}"
+            _push(line_user_id, message)
+
             try:
                 log_event(user["id"], "weekly_summary_sent")
             except Exception:

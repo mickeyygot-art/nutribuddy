@@ -215,6 +215,14 @@ def increment_off_topic(user_id: str) -> int:
 
 # ── WEEKLY MEALS ──────────────────────────────────────────────────────────────
 
+def get_week_top_dishes(user_id: str, n: int = 3) -> list:
+    """YOL-49: Return the top-n dish names by frequency over the past 7 days."""
+    from collections import Counter
+    meals = get_week_meals(user_id)
+    counts = Counter(m["description"] for m in meals)
+    return [dish for dish, _ in counts.most_common(n)]
+
+
 def get_week_meals(user_id: str) -> list:
     # PLAN:
     # 1. Compute Bangkok midnight 7 days ago → convert to UTC

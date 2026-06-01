@@ -694,23 +694,59 @@ def test_transactional_history():
     run("Ends with assistant", h[-1]["role"] == "assistant")
 
 
-MEAL_TYPE_TH = {
-    "breakfast": "เช้า", "lunch": "กลางวัน", "dinner": "เย็น",
-    "snack": "ของว่าง", "late_snack": "มื้อดึก",
-}
+import re as _re
+_EMOJI_RE = _re.compile(
+    "[\U00002600-\U000027BF\U0001F300-\U0001F9FF\U0001FA00-\U0001FAFF"
+    "\U00002702-\U000027B0\U0000FE00-\U0000FE0F\U0001F1E0-\U0001F1FF]"
+)
+_THAI_ENDINGS = ("นะคะ", "นะครับ", "นะ", "ครับ", "ค่ะ", "ค่า", "จ้ะ", "จ้า", "เลย", "น่ะ")
 
 
-def build_daily_recap(meals: list, lang: str) -> str:
-    """Pure mirror of main.build_daily_recap (YOL-43)."""
-    parts = []
-    for m in meals:
-        mtype = m.get("meal_type", "")
-        label = MEAL_TYPE_TH.get(mtype, mtype) if lang == "th" else mtype
-        parts.append(f"{m['description']} ({label})" if label else m["description"])
-    joined = ", ".join(parts)
-    if lang == "th":
-        return f"วันนี้คุณกิน: {joined} 🍽️"
-    return f"Today you had: {joined} 🍽️"
+def ends_complete(text: str) -> bool:
+    """Pure mirror of main.ends_complete (YOL-48/49)."""
+    s = (text or "").rstrip()
+    if not s:
+        return False
+    if s[-1] in ".!?…":
+        return True
+    if _EMOJI_RE.match(s[-1]):
+        return True
+    return any(s.endswith(p) for p in _THAI_ENDINGS)
+
+
+def trim_to_complete(text: str) -> str:
+    """Pure mirror of main.trim_to_complete (YOL-48/49)."""
+    s = (text or "").rstrip()
+    if ends_complete(s):
+        return s
+    best = -1
+    for i, ch in enumerate(s):
+        if ch in ".!?…" or _EMOJI_RE.match(ch):
+            best = i
+    for p in _THAI_ENDINGS:
+        idx = s.rfind(p)
+        if idx != -1:
+            best = max(best, idx + len(p) - 1)
+    return s[:best + 1].rstrip() if best > 0 else ""
+
+
+def split_opener_narrative(raw: str):
+    """Pure mirror of main.split_opener_narrative (YOL-48/49)."""
+    if "===" in raw:
+        a, _, b = raw.partition("===")
+        return a.strip() or None, b.strip()
+    return None, raw.strip()
+
+
+def build_meal_list(dishes: list, lang: str, weekly: bool = False) -> str:
+    """Pure mirror of main.build_meal_list (YOL-48/49)."""
+    lines = []
+    for i, d in enumerate(dishes, 1):
+        if weekly:
+            lines.append(f"อันดับ {i}: {d}" if lang == "th" else f"#{i}: {d}")
+        else:
+            lines.append(f"มื้อที่ {i}: {d}" if lang == "th" else f"Meal {i}: {d}")
+    return "\n".join(lines)
 
 
 def is_suggestion_fresh(last_at_iso, now) -> bool:
@@ -740,20 +776,48 @@ def test_tracking_guard():
     run("Non-internal among internals → tracked", not tracking_guard(False, key, {"Ume"}, "Uother"))
 
 
-def test_daily_recap():
-    print("=== Daily recap builder (YOL-43) ===")
-    meals = [
-        {"description": "ข้าวมันไก่", "meal_type": "breakfast"},
-        {"description": "กะเพราหมู", "meal_type": "lunch"},
-    ]
-    th = build_daily_recap(meals, "th")
-    run("TH recap prefix", th.startswith("วันนี้คุณกิน:"))
-    run("TH localizes meal type", "(เช้า)" in th and "(กลางวัน)" in th)
-    run("TH ends with emoji", th.endswith("🍽️"))
-    en = build_daily_recap(meals, "en")
-    run("EN recap prefix", en.startswith("Today you had:"))
-    run("EN keeps english type", "(breakfast)" in en and "(lunch)" in en)
-    run("Both dishes present", "ข้าวมันไก่" in th and "กะเพราหมู" in th)
+def test_sentence_completeness():
+    print("=== Sentence completeness (YOL-48/49) ===")
+    run("ends with . → complete", ends_complete("Add more veggies tomorrow."))
+    run("ends with ! → complete", ends_complete("Great job today!"))
+    run("ends with ? → complete", ends_complete("Why not try tofu?"))
+    run("ends with emoji → complete", ends_complete("ลองเพิ่มผักดูนะ 🥦"))
+    run("ends with Thai นะ → complete", ends_complete("ลองเพิ่มผักดูนะ"))
+    run("ends with ครับ → complete", ends_complete("ทำได้ดีมากครับ"))
+    run("cut mid-sentence → incomplete", not ends_complete("Tomorrow you could try adding some"))
+    run("empty → incomplete", not ends_complete(""))
+
+
+def test_trim_to_complete():
+    print("=== Trim to last complete sentence (YOL-48/49) ===")
+    out = trim_to_complete("You did great today. Tomorrow you could try adding some")
+    run("Trims dangling clause", out == "You did great today.")
+    run("Already complete unchanged", trim_to_complete("All good today!") == "All good today!")
+    run("Thai trims to particle", trim_to_complete("วันนี้ดีมากนะ พรุ่งนี้ลองเพิ่ม") == "วันนี้ดีมากนะ")
+    run("No boundary → empty", trim_to_complete("just a fragment no end") == "")
+
+
+def test_split_opener_narrative():
+    print("=== Opener/narrative split (YOL-48/49) ===")
+    o, n = split_opener_narrative("You logged 3 meals today 🍽️\n===\nNice variety today. Try kale tomorrow 🥬")
+    run("Opener parsed", o == "You logged 3 meals today 🍽️")
+    run("Narrative parsed", n == "Nice variety today. Try kale tomorrow 🥬")
+    o, n = split_opener_narrative("No separator here, all one blob")
+    run("No separator → opener None", o is None)
+    run("No separator → whole as narrative", n == "No separator here, all one blob")
+
+
+def test_meal_list_builder():
+    print("=== Meal list builder (YOL-48/49) ===")
+    daily_th = build_meal_list(["ข้าวมันไก่", "กะเพรา"], "th", weekly=False)
+    run("Daily TH มื้อที่", "มื้อที่ 1: ข้าวมันไก่" in daily_th and "มื้อที่ 2: กะเพรา" in daily_th)
+    daily_en = build_meal_list(["Pad Thai"], "en", weekly=False)
+    run("Daily EN Meal", daily_en == "Meal 1: Pad Thai")
+    weekly_th = build_meal_list(["ส้มตำ", "ผัดไทย", "ต้มยำ"], "th", weekly=True)
+    run("Weekly TH อันดับ", "อันดับ 1: ส้มตำ" in weekly_th and "อันดับ 3: ต้มยำ" in weekly_th)
+    weekly_en = build_meal_list(["Som Tam"], "en", weekly=True)
+    run("Weekly EN rank", weekly_en == "#1: Som Tam")
+    run("Empty dishes → empty", build_meal_list([], "th") == "")
 
 
 def test_suggestion_freshness():
@@ -843,7 +907,10 @@ if __name__ == "__main__":
         test_cap_history_date,
         test_transactional_history,
         test_tracking_guard,
-        test_daily_recap,
+        test_sentence_completeness,
+        test_trim_to_complete,
+        test_split_opener_narrative,
+        test_meal_list_builder,
         test_suggestion_freshness,
         test_conversational_whitelist,
         test_meal_report_detection,
