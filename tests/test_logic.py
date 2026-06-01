@@ -776,6 +776,83 @@ def test_tracking_guard():
     run("Non-internal among internals → tracked", not tracking_guard(False, key, {"Ume"}, "Uother"))
 
 
+def compute_streak(date_keys, today):
+    """Pure mirror of database.compute_streak (YOL-52)."""
+    from datetime import timedelta as _td
+    day = today
+    if day.isoformat() not in date_keys:
+        day = today - _td(days=1)
+    streak, grace = 0, 0
+    while True:
+        if day.isoformat() in date_keys:
+            streak += 1
+            day = day - _td(days=1)
+        elif streak > 0 and grace < (streak // 7 + 1):
+            grace += 1
+            day = day - _td(days=1)
+        else:
+            break
+    return streak
+
+
+def streak_milestone(s):
+    return s if s in (3, 7, 14, 30) else None
+
+
+def volume_milestone(c):
+    return c if c in (10, 30, 100) else None
+
+
+def winback_eligible(last_active_iso, last_winback_iso):
+    """Pure mirror of get_lapsed_users' eligibility filter (YOL-51)."""
+    return (not last_winback_iso) or (last_winback_iso < last_active_iso)
+
+
+def test_streak():
+    print("=== Logging streak with grace (YOL-52) ===")
+    from datetime import date, timedelta
+    today = date(2026, 6, 1)
+    def keys(*offsets):
+        return {(today - timedelta(days=o)).isoformat() for o in offsets}
+    run("5 consecutive incl today", compute_streak(keys(0,1,2,3,4), today) == 5)
+    run("today pending, yesterday-back 4", compute_streak(keys(1,2,3,4), today) == 4)
+    run("single slip is graced", compute_streak(keys(0,1,2,4,5), today) == 5)
+    run("two-day gap breaks streak", compute_streak(keys(0,1,4,5), today) == 2)
+    run("no meals → 0", compute_streak(set(), today) == 0)
+    run("only today → 1", compute_streak(keys(0), today) == 1)
+    run("gap then nothing recent → 0", compute_streak(keys(10,11,12), today) == 0)
+
+
+def test_milestones():
+    print("=== Milestones (YOL-53) ===")
+    run("10th meal → milestone", volume_milestone(10) == 10)
+    run("30th meal → milestone", volume_milestone(30) == 30)
+    run("100th meal → milestone", volume_milestone(100) == 100)
+    run("11th meal → none", volume_milestone(11) is None)
+    run("streak 7 → milestone", streak_milestone(7) == 7)
+    run("streak 3 → milestone", streak_milestone(3) == 3)
+    run("streak 5 → none", streak_milestone(5) is None)
+
+
+def test_winback_eligibility():
+    print("=== Win-back eligibility (YOL-51) ===")
+    run("never nudged → eligible", winback_eligible("2026-05-28T10:00:00Z", None))
+    run("nudged before this lapse → eligible",
+        winback_eligible("2026-05-28T10:00:00Z", "2026-05-20T10:00:00Z"))
+    run("already nudged this lapse → not eligible",
+        not winback_eligible("2026-05-28T10:00:00Z", "2026-05-29T10:00:00Z"))
+
+
+def test_summary_variation():
+    print("=== Summary variation (YOL-54) ===")
+    def angle(seed):
+        return ("a practical tip", "a surprising insight from their data", "pure encouragement")[seed % 3]
+    def asks(seed):
+        return seed % 3 == 0
+    run("3 distinct angles cycle", len({angle(0), angle(1), angle(2)}) == 3)
+    run("question ~1 in 3 (seed 0)", asks(0) and not asks(1) and not asks(2))
+
+
 def test_sentence_completeness():
     print("=== Sentence completeness (YOL-48/49) ===")
     run("ends with . → complete", ends_complete("Add more veggies tomorrow."))
@@ -907,6 +984,10 @@ if __name__ == "__main__":
         test_cap_history_date,
         test_transactional_history,
         test_tracking_guard,
+        test_streak,
+        test_milestones,
+        test_winback_eligibility,
+        test_summary_variation,
         test_sentence_completeness,
         test_trim_to_complete,
         test_split_opener_narrative,

@@ -6,7 +6,7 @@ import time
 import urllib.request
 import urllib.error
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, Request, HTTPException
 from linebot.v3 import WebhookHandler
 from linebot.v3.messaging import (
@@ -27,6 +27,8 @@ from database import (
     is_blocked, clear_block, force_block, increment_off_topic, get_all_users,
     update_last_meal_type, update_last_active, log_event, supabase,
     update_user_suggestion, clear_user_suggestion, get_liff_summary,
+    get_lapsed_users, mark_winback_sent, get_meal_count, get_meal_dates,
+    compute_streak, bkk_date_key,
 )
 import tracking
 
@@ -95,6 +97,34 @@ WEEKLY_NO_MEALS_EN = "No meals logged last week — try sending a food photo thi
 # YOL-48: daily no-meals fallback (no Claude call)
 DAILY_NO_MEALS_TH = "วันนี้ยังไม่มีมื้อไหนเลยนะ — ไม่เป็นไร คืนนี้ยังทัน 🌿"
 DAILY_NO_MEALS_EN = "Nothing logged today — still time to catch dinner tonight 🌿"
+
+# YOL-51: win-back nudge (warm, no guilt)
+WINBACK_TH = "คิดถึงนะ 🌿 ไม่ได้คุยกันสองสามวันเลย — วันนี้กินอะไรอร่อยๆ บ้าง? ส่งรูปมาให้ NutriBuddy ดูได้เลย"
+WINBACK_EN = "Missed you 🌿 It's been a few days — what'd you eat today? Send me a photo anytime."
+
+# YOL-52/53: milestone copy (templated — no Claude call). {n} = the milestone number.
+MILESTONE_VOLUME_TH = {
+    10: "นี่คือมื้อที่ 10 ที่เราบันทึกด้วยกันแล้วนะ ดีใจที่ได้ดูแลมื้ออาหารไปด้วยกัน 🎉",
+    30: "30 มื้อแล้ว! เห็นความตั้งใจของคุณเลย ภูมิใจนะ 🎉",
+    100: "ครบ 100 มื้อแล้วนะ นี่คือนิสัยที่ดีจริงๆ สุดยอดไปเลย 🎉",
+}
+MILESTONE_VOLUME_EN = {
+    10: "That's your 10th meal logged with me — love that we're doing this together 🎉",
+    30: "30 meals in! Your consistency really shows 🎉",
+    100: "100 meals logged — this is a real habit now. Amazing 🎉",
+}
+MILESTONE_STREAK_TH = {
+    3: "บันทึกติดกัน 3 วันแล้วนะ เริ่มเป็นจังหวะที่ดีเลย 🔥",
+    7: "ครบ 7 วันติด! คุณกำลังสร้างนิสัยที่ดีจริงๆ 🔥",
+    14: "สองสัปดาห์ติดต่อกันแล้ว เก่งมากเลยนะ 🔥",
+    30: "30 วันติด! นี่คือความมุ่งมั่นระดับสุดยอดเลย 🔥",
+}
+MILESTONE_STREAK_EN = {
+    3: "3 days in a row — you're finding a nice rhythm 🔥",
+    7: "7-day streak! You're building a real habit 🔥",
+    14: "Two full weeks in a row — that's impressive 🔥",
+    30: "30-day streak! Incredible commitment 🔥",
+}
 
 UNBLOCK_KEYWORDS = {
     "เริ่มใหม่", "ขอโทษ", "ยกเลิก", "unblock",
@@ -413,6 +443,24 @@ def build_meal_list(dishes: list, lang: str, weekly: bool = False) -> str:
     return "\n".join(lines)
 
 
+def streak_milestone(streak: int):
+    return streak if streak in (3, 7, 14, 30) else None
+
+
+def volume_milestone(count: int):
+    return count if count in (10, 30, 100) else None
+
+
+def summary_angle(seed: int) -> str:
+    """YOL-54: rotate the summary's flavour so it isn't identical every day."""
+    return ("a practical tip", "a surprising insight from their data", "pure encouragement")[seed % 3]
+
+
+def summary_asks_question(seed: int) -> bool:
+    """YOL-54: only ~1 in 3 summaries ends with an optional question (avoid nagging)."""
+    return seed % 3 == 0
+
+
 def complete_narrative(text: str, lang: str) -> str:
     """YOL-48/49: ensure the narrative is a whole thought — never truncated mid-sentence.
     One continuation call if cut off; otherwise trim to the last complete sentence."""
@@ -480,6 +528,23 @@ def check_follow_through(user: dict, dishes: list) -> str | None:
             except Exception as e:
                 print(f"clear_user_suggestion error for {user['id']}: {e}")
             return resp.content[0].text
+    return None
+
+
+def check_milestone(user_id: str, lang: str, is_first_today: bool) -> str | None:
+    """YOL-52/53: return a templated milestone celebration, or None. Volume milestones
+    fire on any qualifying log; streak milestones only on the first meal of the day."""
+    try:
+        vm = volume_milestone(get_meal_count(user_id))
+        if vm:
+            return (MILESTONE_VOLUME_TH if lang == "th" else MILESTONE_VOLUME_EN)[vm]
+        if is_first_today:
+            keys = {bkk_date_key(x) for x in get_meal_dates(user_id, 45)}
+            sm = streak_milestone(compute_streak(keys, datetime.now(BKK).date()))
+            if sm:
+                return (MILESTONE_STREAK_TH if lang == "th" else MILESTONE_STREAK_EN)[sm]
+    except Exception as e:
+        print(f"Milestone check error for {user_id}: {e}")
     return None
 
 
@@ -674,6 +739,7 @@ Rules: max 4 sentences, max 1 emoji at the end, plain text only, reply in {lang_
 
     # YOL-24/32: Silently log all meals reported in the message
     logged_dishes = []
+    is_first_today = not get_today_meals(user_id) if triage["meals"] else False
     try:
         for entry in triage["meals"]:
             dish = (entry.get("dish") or "").strip()[:200]
@@ -683,13 +749,15 @@ Rules: max 4 sentences, max 1 emoji at the end, plain text only, reply in {lang_
     except Exception as e:
         print(f"Text meal log error for {user_id}: {e}")  # Non-fatal
 
-    # YOL-44: celebrate if any logged dish matches yesterday's coaching suggestion
+    # YOL-44 follow-through takes priority; else YOL-52/53 milestone
     celebration = None
     if logged_dishes:
         try:
             celebration = check_follow_through(user, logged_dishes)
         except Exception as e:
             print(f"Follow-through error for {user_id}: {e}")
+        if not celebration:
+            celebration = check_milestone(user_id, lang, is_first_today)
 
     # YOL-31: Retroactive meal-type correction from a follow-up message (e.g. photo then
     # "อาหารเช้านะ"). Only when triage extracted no meals of its own, so we don't fight it.
@@ -813,15 +881,18 @@ def handle_image(event):
         nudge = UNKNOWN_DISH_TH if lang == "th" else UNKNOWN_DISH_EN
         coaching_text = coaching_text + "\n" + nudge
     else:
+        is_first_today = not get_today_meals(user_id)  # before logging this one
         try:
             log_meal(user_id, dish_name, source="photo")
         except Exception as e:
             print(f"Meal log error for {user_id}: {e}")
-        # YOL-44: celebrate if this matches yesterday's coaching suggestion
+        # YOL-44: follow-through celebration takes priority; else YOL-52/53 milestone
         try:
             celebration = check_follow_through(user, [dish_name])
         except Exception as e:
             print(f"Follow-through error for {user_id}: {e}")
+        if not celebration:
+            celebration = check_milestone(user_id, lang, is_first_today)
 
     # YOL-19: Add photo + reply to conversation history
     history = conversation_history.setdefault(line_user_id, [])
@@ -859,6 +930,19 @@ def send_daily_summaries():
             last_suggestion = user.get("last_suggestion") or "none"
             lang_word = "Thai" if lang == "th" else "English"
 
+            # YOL-52: current logging streak (BKK)
+            try:
+                streak = compute_streak(
+                    {bkk_date_key(x) for x in get_meal_dates(user["id"], 45)},
+                    datetime.now(BKK).date(),
+                )
+            except Exception:
+                streak = 0
+            # YOL-54: rotate angle + sometimes ask an optional question
+            seed = datetime.now(BKK).timetuple().tm_yday
+            angle = summary_angle(seed)
+            ask_q = summary_asks_question(seed)
+
             focus = {
                 "lose_weight":  "Name a specific lower-cal swap to try tomorrow.",
                 "eat_clean":    "Name a specific vegetable to add tomorrow.",
@@ -866,14 +950,20 @@ def send_daily_summaries():
                 "no_goal":      "Note a positive pattern and suggest one simple habit.",
             }.get(goal, "Suggest one specific, practical thing for tomorrow.")
 
+            streak_line = (f"The user has a {streak}-day logging streak — if 3 or more, mention it warmly in Part A."
+                           if streak >= 3 else "")
+            question_line = ("End Part B with a light, genuinely optional question inviting a reply "
+                             "(e.g. about eating out or tomorrow's plan). Never pressure." if ask_q else "")
+
             prompt = f"""User logged {n} meal(s) today. Dishes: {', '.join(dishes)}.
 User goal: {goal_label}
 User language: {lang_word}
 Yesterday's suggestion (if any): {last_suggestion}
+{streak_line}
 
 Write TWO parts separated by a line containing only ===
 Part A: a warm opener, 1 sentence, mentions they logged {n} meal(s), ends with 1 emoji.
-Part B: 2-3 sentences. Observe a pattern from today's dishes, connect to their goal, then give ONE specific actionable suggestion for tomorrow — name a real dish or ingredient. {focus} Do not repeat yesterday's suggestion. End with 1 emoji.
+Part B: 2-3 sentences with the flavour of {angle}. Observe a pattern from today's dishes, connect to their goal, then give ONE specific actionable suggestion for tomorrow — name a real dish or ingredient. {focus} Do not repeat yesterday's suggestion. {question_line} End with 1 emoji.
 
 Tone: data-light storyteller, warm friend, no numbers, no calories, no lecturing.
 Do NOT list the meals yourself. Plain text only, no markdown. Reply in {lang_word}."""
@@ -933,6 +1023,10 @@ def send_weekly_summaries():
             tone = ("celebratory" if days >= 5 else
                     "warm and encouraging" if days >= 3 else
                     "gentle, no guilt")
+            # YOL-54: sometimes invite a reply
+            ask_q = summary_asks_question(datetime.now(BKK).timetuple().tm_yday)
+            question_line = ("End Part B with a light, genuinely optional question inviting a reply "
+                             "about the week ahead. Never pressure." if ask_q else "")
             focus = {
                 "lose_weight":  "Spot a weekly pattern and name one swap to try.",
                 "eat_clean":    "Celebrate any clean choices and name one vegetable to add this week.",
@@ -947,7 +1041,7 @@ User language: {lang_word}
 
 Write TWO parts separated by a line containing only ===
 Part A: a warm opener, 1 sentence, mentions they logged {days} of 7 days, ends with 1 emoji. Tone: {tone}.
-Part B: 2-3 sentences. Observe a weekly eating pattern, call out one positive thing, then give ONE specific suggestion for the coming week — name a real dish or ingredient. {focus} End with 1 emoji.
+Part B: 2-3 sentences. Observe a weekly eating pattern, call out one positive thing, then give ONE specific suggestion for the coming week — name a real dish or ingredient. {focus} {question_line} End with 1 emoji.
 
 Tone: data-light storyteller, warm friend, no numbers, no calories, no lecturing.
 Do NOT list the dishes yourself. Plain text only, no markdown. Reply in {lang_word}."""
@@ -975,11 +1069,32 @@ Do NOT list the dishes yourself. Plain text only, no markdown. Reply in {lang_wo
             print(f"Weekly summary error for {user.get('line_user_id')}: {e}")
 
 
+# ── WIN-BACK NUDGE (YOL-51) — 17:00 Bangkok = 10:00 UTC ───────────────────────
+
+def send_winback_nudges():
+    # PLAN (YOL-51): once per lapse, nudge users idle 3–5 days. Warm, no guilt.
+    #   Skip blocked users. Mark sent so they get exactly one nudge per quiet streak.
+    for user in get_lapsed_users():
+        try:
+            if is_blocked(user["id"]):
+                continue
+            lang = user.get("language", "th")
+            _push(user["line_user_id"], WINBACK_TH if lang == "th" else WINBACK_EN)
+            mark_winback_sent(user["id"])
+            try:
+                log_event(user["id"], "winback_sent")
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"Win-back error for {user.get('line_user_id')}: {e}")
+
+
 # ── SCHEDULER (20:00 Bangkok = 13:00 UTC) ─────────────────────────────────────
 
 scheduler = BackgroundScheduler(timezone=pytz.utc)
 scheduler.add_job(send_daily_summaries, "cron", hour=13, minute=0)
 scheduler.add_job(send_weekly_summaries, "cron", day_of_week="mon", hour=1, minute=0)
+scheduler.add_job(send_winback_nudges, "cron", hour=10, minute=0)  # 17:00 BKK
 scheduler.start()
 
 
@@ -1155,4 +1270,14 @@ def trigger_weekly_summary(request: Request):
     if not expected or request.headers.get("X-Cron-Secret", "") != expected:
         raise HTTPException(status_code=403, detail="Forbidden")
     send_weekly_summaries()
+    return {"status": "sent"}
+
+
+@app.post("/cron/winback")
+def trigger_winback(request: Request):
+    """Manual trigger for win-back nudges — protected by CRON_SECRET header."""
+    expected = os.environ.get("CRON_SECRET", "")
+    if not expected or request.headers.get("X-Cron-Secret", "") != expected:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    send_winback_nudges()
     return {"status": "sent"}

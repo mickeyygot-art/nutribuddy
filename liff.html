@@ -18,6 +18,7 @@
   header .logo span { font-size: 20px; }
   header .sub { font-size: 13px; color: var(--muted); margin-top: 2px; }
 
+  .streak-badge { display: none; text-align: center; margin: 0 auto 18px; background: #fff7ed; color: #c2410c; font-weight: 700; font-size: 15px; padding: 8px 16px; border-radius: 99px; width: fit-content; }
   .stats { display: flex; gap: 12px; margin-bottom: 22px; }
   .stat { flex: 1; background: var(--green-soft); border-radius: 14px; padding: 16px; text-align: center; }
   .stat .num { font-size: 28px; font-weight: 700; color: var(--green); line-height: 1.1; }
@@ -61,6 +62,7 @@
 </div>
 
 <main id="content" class="hidden">
+  <div class="streak-badge" id="streakBadge"></div>
   <div class="stats">
     <div class="stat"><div class="num" id="daysLogged">0</div><div class="lbl">วันที่บันทึก / 7</div></div>
     <div class="stat"><div class="num" id="totalMeals">0</div><div class="lbl">มื้อทั้งหมด</div></div>
@@ -96,6 +98,15 @@
   function render(data) {
     document.getElementById('daysLogged').textContent = data.days_logged || 0;
     document.getElementById('totalMeals').textContent = (data.meals || []).length;
+
+    const streak = data.streak || 0;
+    const badge = document.getElementById('streakBadge');
+    if (streak >= 2) {
+      badge.textContent = `🔥 ${streak} วันติดต่อกัน`;
+      badge.style.display = 'block';
+    } else {
+      badge.style.display = 'none';
+    }
 
     const top = data.top_dishes || [];
     const topEl = document.getElementById('topDishes');

@@ -66,6 +66,57 @@ def clear_user_suggestion(user_id: str):
     ).eq("id", user_id).execute()
 
 
+def get_lapsed_users() -> list:
+    """YOL-51: Users idle 3–5 days who haven't been nudged this lapse window.
+
+    Eligible = last_active_at in [now-5d, now-3d] AND (never nudged OR the last
+    nudge predates their last activity, i.e. it was a previous lapse)."""
+    now = datetime.now(timezone.utc)
+    lo = (now - timedelta(days=5)).isoformat()
+    hi = (now - timedelta(days=3)).isoformat()
+    rows = (
+        supabase.table("users")
+        .select("*")
+        .gte("last_active_at", lo)
+        .lte("last_active_at", hi)
+        .execute()
+        .data
+    )
+    eligible = []
+    for u in rows:
+        wb = u.get("last_winback_at")
+        if not wb or wb < u.get("last_active_at", ""):
+            eligible.append(u)
+    return eligible
+
+
+def mark_winback_sent(user_id: str):
+    """YOL-51: Record that a win-back nudge was sent (one per lapse window)."""
+    supabase.table("users").update(
+        {"last_winback_at": datetime.now(timezone.utc).isoformat()}
+    ).eq("id", user_id).execute()
+
+
+def get_meal_count(user_id: str) -> int:
+    """YOL-53: Total meals ever logged by this user."""
+    result = supabase.table("meals").select("id", count="exact").eq("user_id", user_id).execute()
+    return result.count or 0
+
+
+def get_meal_dates(user_id: str, days: int = 45) -> list:
+    """YOL-52: logged_at values for the last `days` days (for streak calculation)."""
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    rows = (
+        supabase.table("meals")
+        .select("logged_at")
+        .eq("user_id", user_id)
+        .gte("logged_at", since)
+        .execute()
+        .data
+    )
+    return [r["logged_at"] for r in rows]
+
+
 # ── MEALS ─────────────────────────────────────────────────────────────────────
 
 def _meal_type_from_time() -> str:
@@ -215,16 +266,48 @@ def increment_off_topic(user_id: str) -> int:
 
 # ── WEEKLY MEALS ──────────────────────────────────────────────────────────────
 
+def bkk_date_key(iso: str) -> str:
+    """Convert a UTC ISO timestamp to its Bangkok calendar date 'YYYY-MM-DD'."""
+    dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(BKK).date().isoformat()
+
+
+def compute_streak(date_keys: set, today) -> int:
+    """YOL-52: consecutive days (BKK) with >=1 meal, allowing ~1 grace day per 7.
+    An unlogged 'today' is treated as pending (doesn't break the streak)."""
+    day = today
+    if day.isoformat() not in date_keys:
+        day = today - timedelta(days=1)
+    streak, grace = 0, 0
+    while True:
+        if day.isoformat() in date_keys:
+            streak += 1
+            day = day - timedelta(days=1)
+        elif streak > 0 and grace < (streak // 7 + 1):
+            grace += 1
+            day = day - timedelta(days=1)
+        else:
+            break
+    return streak
+
+
 def get_liff_summary(line_user_id: str):
-    """YOL-50: Last-7-day summary for the LIFF dashboard. None if user not found."""
+    """YOL-50/52: Last-7-day summary + current streak for the LIFF dashboard. None if not found."""
     res = supabase.table("users").select("id").eq("line_user_id", line_user_id).execute()
     if not res.data:
         return None
     user_id = res.data[0]["id"]
     meals = get_week_meals(user_id)  # ascending by logged_at
     days_logged = len({m["logged_at"][:10] for m in meals})
+    streak = compute_streak(
+        {bkk_date_key(x) for x in get_meal_dates(user_id, 45)},
+        datetime.now(BKK).date(),
+    )
     return {
         "days_logged": days_logged,
+        "streak": streak,
         "meals": [{"dish": m["description"], "logged_at": m["logged_at"]} for m in meals],
         "top_dishes": get_week_top_dishes(user_id, 3),
     }

@@ -9,7 +9,8 @@ CREATE TABLE IF NOT EXISTS users (
   created_at TIMESTAMPTZ DEFAULT NOW(),
   last_active_at TIMESTAMPTZ,         -- YOL-35: updated on every message
   last_suggestion TEXT,              -- YOL-43: last coaching move sent (for follow-through)
-  last_suggestion_at TIMESTAMPTZ     -- YOL-43: when that suggestion was sent
+  last_suggestion_at TIMESTAMPTZ,    -- YOL-43: when that suggestion was sent
+  last_winback_at TIMESTAMPTZ        -- YOL-51: when the last win-back nudge was sent
 );
 
 CREATE TABLE IF NOT EXISTS meals (
@@ -45,3 +46,6 @@ CREATE TABLE IF NOT EXISTS event_log (
 -- YOL-43: Coaching follow-through columns
 -- ALTER TABLE users ADD COLUMN IF NOT EXISTS last_suggestion TEXT;
 -- ALTER TABLE users ADD COLUMN IF NOT EXISTS last_suggestion_at TIMESTAMPTZ;
+
+-- YOL-51: Win-back nudge column
+-- ALTER TABLE users ADD COLUMN IF NOT EXISTS last_winback_at TIMESTAMPTZ;
