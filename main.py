@@ -69,9 +69,9 @@ ONBOARDING_MSG_1 = """สวัสดี! ฉันคือ NutriBuddy เพ�
 ONBOARDING_MSG_2 = """นี่คือสิ่งที่ NutriBuddy ทำได้
 
 ส่งรูปอาหาร — ฉันจะบอกว่าโภชนาการเป็นยังไงและมีคำแนะนำสำหรับมื้อต่อไป
-บอกชื่อเมนู — พิมพ์ก็ได้ ไม่ต้องมีรูปเสมอไป
+บอกชื่อเมนู — พิมพ์หรือส่งเสียงก็ได้ ไม่ต้องมีรูปเสมอไป
 ถามประวัติ — "เมื่อเช้ากินอะไร" หรือ "เมื่อวานกินอะไรบ้าง"
-เปลี่ยนเป้าหมาย — บอกได้เลยตลอดเวลา
+เปลี่ยนเป้าหมาย — พิมพ์ "เปลี่ยนเป้าหมาย" ได้ตลอดเวลา
 สรุปรายวัน — ทุกคืน 20.00 น. ฉันจะส่งสรุปมื้ออาหารวันนี้ให้
 สรุปรายสัปดาห์ — ทุกวันจันทร์ 8.00 น. ฉันจะส่งภาพรวมของสัปดาห์ที่ผ่านมา"""
 
@@ -915,6 +915,8 @@ def handle_follow(event):
         name = _display_name(event.source.user_id)
         bubble = build_journey_flex(name)
         _reply_flex(event.reply_token, "ยินดีต้อนรับสู่ NutriBuddy! เลือกเป้าหมายของคุณ", bubble)
+        time.sleep(1)
+        _push(event.source.user_id, ONBOARDING_MSG_2)  # capabilities + how to re-open goal menu
     except Exception as e:
         print(f"Onboarding flex error: {e}")  # fall back to text onboarding (YOL-26)
         _reply(event.reply_token, ONBOARDING_MSG_1)
