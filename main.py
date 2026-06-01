@@ -320,15 +320,13 @@ def build_journey_flex(display_name: str = "", current_goal: str | None = None) 
         "weight": "bold", "size": "md", "margin": "lg", "wrap": True,
     })
 
+    # All four goals are equal first-class options — identical styling so none looks
+    # pre-selected. The selected goal is reflected in the header on re-open, plus the
+    # warm confirmation reply (a sent Flex card can't re-highlight after a tap).
     buttons = [{
-        "type": "button", "style": "primary" if g == "lose_weight" else "secondary",
-        "color": "#16a34a" if g == "lose_weight" else None, "height": "sm", "margin": "sm",
+        "type": "button", "style": "secondary", "height": "sm", "margin": "sm",
         "action": {"type": "postback", "label": GOAL_BUTTON_LABEL[g], "data": f"action=set_goal&goal={g}"},
     } for g in ("lose_weight", "eat_clean", "build_muscle", "no_goal")]
-    # strip None color keys (LINE rejects null)
-    for b in buttons:
-        if b.get("color") is None:
-            b.pop("color", None)
 
     return {
         "type": "bubble",
