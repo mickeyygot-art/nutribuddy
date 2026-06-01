@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>NutriBuddy</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+Thai:wght@400;500;700&display=swap" rel="stylesheet">
+<script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
+<style>
+  :root { --green: #16a34a; --green-soft: #dcfce7; --ink: #1f2937; --muted: #9ca3af; --line: #f0f0f0; }
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+  body { font-family: 'Noto Sans Thai', sans-serif; background: #fff; color: var(--ink); max-width: 480px; margin: 0 auto; padding: 20px 18px 48px; }
+
+  header { text-align: center; padding: 8px 0 18px; }
+  header .logo { font-size: 22px; font-weight: 700; color: var(--green); }
+  header .logo span { font-size: 20px; }
+  header .sub { font-size: 13px; color: var(--muted); margin-top: 2px; }
+
+  .stats { display: flex; gap: 12px; margin-bottom: 22px; }
+  .stat { flex: 1; background: var(--green-soft); border-radius: 14px; padding: 16px; text-align: center; }
+  .stat .num { font-size: 28px; font-weight: 700; color: var(--green); line-height: 1.1; }
+  .stat .lbl { font-size: 12px; color: var(--ink); margin-top: 4px; opacity: .8; }
+
+  .section-title { font-size: 13px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; margin: 0 0 10px 2px; }
+
+  .top-dishes { background: #fafafa; border-radius: 14px; padding: 8px 16px; margin-bottom: 24px; }
+  .top-dishes .row { display: flex; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--line); }
+  .top-dishes .row:last-child { border-bottom: none; }
+  .top-dishes .rank { width: 26px; height: 26px; border-radius: 50%; background: var(--green); color: #fff; font-size: 13px; font-weight: 700; display: flex; align-items: center; justify-content: center; margin-right: 12px; flex-shrink: 0; }
+  .top-dishes .name { font-size: 15px; font-weight: 500; }
+
+  .day-group { margin-bottom: 18px; }
+  .day-group .date { font-size: 14px; font-weight: 700; color: var(--green); margin-bottom: 6px; }
+  .day-group .meal { font-size: 15px; padding: 5px 0 5px 16px; position: relative; }
+  .day-group .meal::before { content: "•"; color: var(--green); position: absolute; left: 2px; }
+
+  .empty { text-align: center; color: var(--muted); font-size: 14px; padding: 32px 0; }
+
+  /* loading + error */
+  #loading, #error { text-align: center; padding: 60px 0; }
+  .spinner { width: 36px; height: 36px; border: 3px solid var(--green-soft); border-top-color: var(--green); border-radius: 50%; margin: 0 auto 14px; animation: spin .8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #error p { color: var(--muted); font-size: 15px; margin-bottom: 16px; }
+  #error button { background: var(--green); color: #fff; border: none; border-radius: 10px; padding: 12px 28px; font-size: 15px; font-family: inherit; font-weight: 500; cursor: pointer; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">🥑 NutriBuddy</div>
+  <div class="sub">สัปดาห์นี้</div>
+</header>
+
+<div id="loading"><div class="spinner"></div><div style="color:var(--muted);font-size:14px">กำลังโหลด...</div></div>
+
+<div id="error" class="hidden">
+  <p>ไม่สามารถโหลดข้อมูลได้ — ลองใหม่อีกครั้ง</p>
+  <button onclick="load()">ลองใหม่</button>
+</div>
+
+<main id="content" class="hidden">
+  <div class="stats">
+    <div class="stat"><div class="num" id="daysLogged">0</div><div class="lbl">วันที่บันทึก / 7</div></div>
+    <div class="stat"><div class="num" id="totalMeals">0</div><div class="lbl">มื้อทั้งหมด</div></div>
+  </div>
+
+  <div id="topSection">
+    <div class="section-title">เมนูยอดนิยมสัปดาห์นี้</div>
+    <div class="top-dishes" id="topDishes"></div>
+  </div>
+
+  <div class="section-title">ประวัติอาหาร 7 วัน</div>
+  <div id="history"></div>
+</main>
+
+<script>
+  const LIFF_ID = "__LIFF_ID__";
+  const THAI_MONTHS = ['ม.ค.','ก.พ.','มี.ค.','เม.ย.','พ.ค.','มิ.ย.','ก.ค.','ส.ค.','ก.ย.','ต.ค.','พ.ย.','ธ.ค.'];
+
+  function bkkParts(iso) {
+    const fmt = new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Bangkok', day: 'numeric', month: 'numeric', year: 'numeric' });
+    const p = fmt.formatToParts(new Date(iso));
+    const get = t => p.find(x => x.type === t).value;
+    return { day: get('day'), month: parseInt(get('month'), 10), year: get('year') };
+  }
+  function thaiDate(iso) { const p = bkkParts(iso); return `${p.day} ${THAI_MONTHS[p.month - 1]}`; }
+  function dateKey(iso) { const p = bkkParts(iso); return `${p.year}-${String(p.month).padStart(2,'0')}-${String(p.day).padStart(2,'0')}`; }
+  const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
+
+  function show(id) {
+    for (const x of ['loading', 'error', 'content']) document.getElementById(x).classList.toggle('hidden', x !== id);
+  }
+
+  function render(data) {
+    document.getElementById('daysLogged').textContent = data.days_logged || 0;
+    document.getElementById('totalMeals').textContent = (data.meals || []).length;
+
+    const top = data.top_dishes || [];
+    const topEl = document.getElementById('topDishes');
+    if (top.length) {
+      topEl.innerHTML = top.map((d, i) =>
+        `<div class="row"><div class="rank">${i + 1}</div><div class="name">${esc(d)}</div></div>`).join('');
+      document.getElementById('topSection').classList.remove('hidden');
+    } else {
+      document.getElementById('topSection').classList.add('hidden');
+    }
+
+    const hist = document.getElementById('history');
+    const meals = data.meals || [];
+    if (!meals.length) {
+      hist.innerHTML = '<div class="empty">ยังไม่มีอาหารที่บันทึกในสัปดาห์นี้</div>';
+      return;
+    }
+    // Group by Bangkok date, newest first
+    const groups = {};
+    for (const m of meals) {
+      const k = dateKey(m.logged_at);
+      (groups[k] = groups[k] || { label: thaiDate(m.logged_at), dishes: [] }).dishes.push(m.dish);
+    }
+    const keys = Object.keys(groups).sort().reverse();
+    hist.innerHTML = keys.map(k =>
+      `<div class="day-group"><div class="date">${esc(groups[k].label)}</div>` +
+      groups[k].dishes.map(d => `<div class="meal">${esc(d)}</div>`).join('') +
+      `</div>`).join('');
+  }
+
+  async function load() {
+    show('loading');
+    try {
+      const token = liff.getAccessToken();
+      const res = await fetch('/api/liff/meals', { headers: { Authorization: `Bearer ${token}` } });
+      if (!res.ok) throw new Error('http ' + res.status);
+      render(await res.json());
+      show('content');
+    } catch (e) {
+      show('error');
+    }
+  }
+
+  liff.init({ liffId: LIFF_ID }).then(() => {
+    if (!liff.isLoggedIn()) { liff.login(); return; }
+    load();
+  }).catch(() => show('error'));
+</script>
+</body>
+</html>

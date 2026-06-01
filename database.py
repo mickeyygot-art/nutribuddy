@@ -215,6 +215,21 @@ def increment_off_topic(user_id: str) -> int:
 
 # ── WEEKLY MEALS ──────────────────────────────────────────────────────────────
 
+def get_liff_summary(line_user_id: str):
+    """YOL-50: Last-7-day summary for the LIFF dashboard. None if user not found."""
+    res = supabase.table("users").select("id").eq("line_user_id", line_user_id).execute()
+    if not res.data:
+        return None
+    user_id = res.data[0]["id"]
+    meals = get_week_meals(user_id)  # ascending by logged_at
+    days_logged = len({m["logged_at"][:10] for m in meals})
+    return {
+        "days_logged": days_logged,
+        "meals": [{"dish": m["description"], "logged_at": m["logged_at"]} for m in meals],
+        "top_dishes": get_week_top_dishes(user_id, 3),
+    }
+
+
 def get_week_top_dishes(user_id: str, n: int = 3) -> list:
     """YOL-49: Return the top-n dish names by frequency over the past 7 days."""
     from collections import Counter

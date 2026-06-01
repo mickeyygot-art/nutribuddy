@@ -1,7 +1,9 @@
 import os
 import re
+import json
 import base64
 import time
+import urllib.request
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request, HTTPException
@@ -23,7 +25,7 @@ from database import (
     log_meal, get_today_meals, get_meals_by_date_range, get_week_meals, get_week_top_dishes,
     is_blocked, clear_block, force_block, increment_off_topic, get_all_users,
     update_last_meal_type, update_last_active, log_event, supabase,
-    update_user_suggestion, clear_user_suggestion,
+    update_user_suggestion, clear_user_suggestion, get_liff_summary,
 )
 import tracking
 
@@ -985,6 +987,52 @@ scheduler.start()
 @app.get("/health")
 def health():
     return {"status": "healthy", "service": "NutriBuddy"}
+
+
+# ── LIFF DASHBOARD (YOL-50) ───────────────────────────────────────────────────
+
+def _liff_user_id(access_token: str) -> str | None:
+    """Validate a LIFF access token and return the LINE user ID, or None.
+
+    Note: LINE's /oauth2/v2.1/verify endpoint validates a token but does NOT
+    return the user ID. The Profile API both validates the token (401 on a bad
+    one) and returns userId, so we use it.
+    """
+    try:
+        req = urllib.request.Request(
+            "https://api.line.me/v2/profile",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        return data.get("userId")
+    except Exception as e:
+        print(f"LIFF token verify error: {e}")
+        return None
+
+
+@app.get("/liff")
+def liff_page():
+    """Serve the LIFF dashboard, injecting LIFF_ID from env."""
+    from fastapi.responses import HTMLResponse
+    with open("liff.html", "r", encoding="utf-8") as f:
+        html = f.read()
+    return HTMLResponse(html.replace("__LIFF_ID__", os.environ.get("LIFF_ID", "")))
+
+
+@app.get("/api/liff/meals")
+def liff_meals(request: Request):
+    """Return the signed-in LIFF user's 7-day meal summary."""
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing token")
+    line_user_id = _liff_user_id(auth[7:].strip())
+    if not line_user_id:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    summary = get_liff_summary(line_user_id)
+    if summary is None:
+        raise HTTPException(status_code=401, detail="User not found")
+    return summary
 
 
 @app.post("/cron/daily-summary")
