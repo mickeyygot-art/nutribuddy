@@ -28,7 +28,7 @@ from database import (
     update_last_meal_type, update_last_active, log_event, supabase,
     update_user_suggestion, clear_user_suggestion, get_liff_summary,
     get_lapsed_users, mark_winback_sent, get_meal_count, get_meal_dates,
-    compute_streak, bkk_date_key,
+    compute_streak, bkk_date_key, get_recent_meals, update_user_profile,
 )
 import tracking
 
@@ -531,6 +531,61 @@ def check_follow_through(user: dict, dishes: list) -> str | None:
     return None
 
 
+def is_profile_stale(profile_updated_at, now) -> bool:
+    """YOL-59: True if the coaching profile is missing or older than 24h."""
+    if not profile_updated_at:
+        return True
+    try:
+        ts = datetime.fromisoformat(str(profile_updated_at).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return True
+    return (now - ts) >= timedelta(hours=24)
+
+
+def profile_context(profile) -> str:
+    """YOL-59: system-prompt snippet that injects the learned profile, or '' if none."""
+    if not profile:
+        return ""
+    return ("\n\nWHAT YOU REMEMBER ABOUT THIS USER (use to personalize warmly, never to judge):\n"
+            + profile)
+
+
+def maybe_update_profile(user: dict, line_user_id: str):
+    """YOL-59: refresh the learned profile via one cheap Haiku pass, only when stale
+    (>24h). Learns silently from recent meals + recent things the user said."""
+    if not is_profile_stale(user.get("profile_updated_at"), datetime.now(timezone.utc)):
+        return
+    try:
+        meals = get_recent_meals(user["id"], 20)
+        if not meals:
+            return
+        meal_list = ", ".join(m["description"] for m in meals)
+        recent_msgs = " | ".join(
+            h["content"] for h in conversation_history.get(line_user_id, [])
+            if h.get("role") == "user"
+        )[:500]
+        goal_label = GOAL_LABEL.get(user.get("goal", "no_goal"), "no specific goal")
+        existing = user.get("coaching_profile") or "none"
+        resp = claude.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=130,
+            messages=[{"role": "user", "content":
+                f"You maintain a compact coaching profile for a Thai food/health chatbot user.\n"
+                f"Goal: {goal_label}\n"
+                f"Recent meals (newest first): {meal_list}\n"
+                f"Recent things the user said: {recent_msgs or 'none'}\n"
+                f"Existing profile: {existing}\n\n"
+                f"Write an updated profile: 3-5 very short facts about their eating patterns, "
+                f"preferences, recurring dishes, and any stated dietary avoidances (e.g. 'no pork'). "
+                f"Food and behavior ONLY — no names, no PII. Plain text, max 60 words. "
+                f"Reply with ONLY the profile text."}],
+        )
+        profile = clean_for_line(resp.content[0].text)[:600]
+        update_user_profile(user["id"], profile)
+    except Exception as e:
+        print(f"Profile update error for {user.get('id')}: {e}")
+
+
 def check_milestone(user_id: str, lang: str, is_first_today: bool) -> str | None:
     """YOL-52/53: return a templated milestone celebration, or None. Volume milestones
     fire on any qualifying log; streak milestones only on the first meal of the day."""
@@ -793,6 +848,7 @@ Rules: max 4 sentences, max 1 emoji at the end, plain text only, reply in {lang_
     # On-topic: Claude with conversation history (YOL-19)
     goal_label = GOAL_LABEL.get(user["goal"], "no specific goal")
     system = SYSTEM_PROMPT.format(goal=goal_label)
+    system += profile_context(user.get("coaching_profile"))  # YOL-59
     if meal_context_parts:
         system += "\n\nMEAL CONTEXT (use this when answering questions about what was eaten):\n" + "\n".join(meal_context_parts)
 
@@ -815,6 +871,8 @@ Rules: max 4 sentences, max 1 emoji at the end, plain text only, reply in {lang_
     _reply(event.reply_token, reply_text)
     if celebration:
         _push(line_user_id, celebration)
+
+    maybe_update_profile(user, line_user_id)  # YOL-59: refresh if stale (post-reply, no added latency)
 
 
 # ── IMAGE ─────────────────────────────────────────────────────────────────────
@@ -858,7 +916,7 @@ def handle_image(event):
     resp = claude.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=300,
-        system=SYSTEM_PROMPT.format(goal=goal_label),
+        system=SYSTEM_PROMPT.format(goal=goal_label) + profile_context(user.get("coaching_profile")),  # YOL-59
         messages=[{"role": "user", "content": [
             {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64}},
             {"type": "text", "text": vision_prompt},
@@ -904,6 +962,9 @@ def handle_image(event):
     _reply(event.reply_token, coaching_text)
     if celebration:
         _push(line_user_id, celebration)
+
+    if dish_name:
+        maybe_update_profile(user, line_user_id)  # YOL-59: refresh if stale
 
 
 # ── DAILY SUMMARY ─────────────────────────────────────────────────────────────
@@ -954,11 +1015,14 @@ def send_daily_summaries():
                            if streak >= 3 else "")
             question_line = ("End Part B with a light, genuinely optional question inviting a reply "
                              "(e.g. about eating out or tomorrow's plan). Never pressure." if ask_q else "")
+            profile = user.get("coaching_profile")  # YOL-59
+            profile_line = f"What you remember about this user: {profile}" if profile else ""
 
             prompt = f"""User logged {n} meal(s) today. Dishes: {', '.join(dishes)}.
 User goal: {goal_label}
 User language: {lang_word}
 Yesterday's suggestion (if any): {last_suggestion}
+{profile_line}
 {streak_line}
 
 Write TWO parts separated by a line containing only ===
@@ -1034,10 +1098,14 @@ def send_weekly_summaries():
                 "no_goal":      "Celebrate consistency and suggest one simple habit for the week.",
             }.get(goal, "Suggest one specific thing to try this week.")
 
+            profile = user.get("coaching_profile")  # YOL-59
+            profile_line = f"What you remember about this user: {profile}" if profile else ""
+
             prompt = f"""User logged meals on {days} of 7 days this week.
 Top dishes (by frequency): {', '.join(top_dishes)}.
 User goal: {goal_label}
 User language: {lang_word}
+{profile_line}
 
 Write TWO parts separated by a line containing only ===
 Part A: a warm opener, 1 sentence, mentions they logged {days} of 7 days, ends with 1 emoji. Tone: {tone}.
@@ -1079,7 +1147,24 @@ def send_winback_nudges():
             if is_blocked(user["id"]):
                 continue
             lang = user.get("language", "th")
-            _push(user["line_user_id"], WINBACK_TH if lang == "th" else WINBACK_EN)
+            # YOL-59: personalize the nudge with the learned profile when available
+            profile = user.get("coaching_profile")
+            msg = WINBACK_TH if lang == "th" else WINBACK_EN
+            if profile:
+                try:
+                    resp = claude.messages.create(
+                        model="claude-sonnet-4-6",
+                        max_tokens=90,
+                        messages=[{"role": "user", "content":
+                            f"Write a warm, no-guilt win-back message to a user who's been quiet a few days. "
+                            f"1-2 short sentences, reference something they enjoy from this profile, and invite "
+                            f"them to log a meal. End with 1 emoji. Reply in {'Thai' if lang == 'th' else 'English'}.\n\n"
+                            f"Profile: {profile}"}],
+                    )
+                    msg = resp.content[0].text
+                except Exception as e:
+                    print(f"Win-back personalize error for {user['id']}: {e}")
+            _push(user["line_user_id"], msg)
             mark_winback_sent(user["id"])
             try:
                 log_event(user["id"], "winback_sent")

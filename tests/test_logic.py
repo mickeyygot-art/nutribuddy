@@ -808,6 +808,45 @@ def winback_eligible(last_active_iso, last_winback_iso):
     return (not last_winback_iso) or (last_winback_iso < last_active_iso)
 
 
+def is_profile_stale(profile_updated_at, now):
+    """Pure mirror of main.is_profile_stale (YOL-59)."""
+    from datetime import datetime as _dt, timedelta as _td
+    if not profile_updated_at:
+        return True
+    try:
+        ts = _dt.fromisoformat(str(profile_updated_at).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return True
+    return (now - ts) >= _td(hours=24)
+
+
+def profile_context(profile):
+    """Pure mirror of main.profile_context (YOL-59)."""
+    if not profile:
+        return ""
+    return ("\n\nWHAT YOU REMEMBER ABOUT THIS USER (use to personalize warmly, never to judge):\n" + profile)
+
+
+def test_profile_staleness():
+    print("=== Coaching profile staleness (YOL-59) ===")
+    from datetime import datetime, timezone, timedelta
+    now = datetime.now(timezone.utc)
+    run("None → stale (needs first build)", is_profile_stale(None, now))
+    run("empty string → stale", is_profile_stale("", now))
+    run("1h old → fresh", not is_profile_stale((now - timedelta(hours=1)).isoformat(), now))
+    run("23h old → fresh", not is_profile_stale((now - timedelta(hours=23)).isoformat(), now))
+    run("25h old → stale", is_profile_stale((now - timedelta(hours=25)).isoformat(), now))
+    run("malformed → stale", is_profile_stale("not-a-date", now))
+
+
+def test_profile_context():
+    print("=== Profile context injection (YOL-59) ===")
+    run("None → empty (no injection)", profile_context(None) == "")
+    run("empty → empty", profile_context("") == "")
+    ctx = profile_context("Skips breakfast; loves som tum; no pork.")
+    run("present → injected", "som tum" in ctx and "REMEMBER" in ctx)
+
+
 def test_streak():
     print("=== Logging streak with grace (YOL-52) ===")
     from datetime import date, timedelta
@@ -984,6 +1023,8 @@ if __name__ == "__main__":
         test_cap_history_date,
         test_transactional_history,
         test_tracking_guard,
+        test_profile_staleness,
+        test_profile_context,
         test_streak,
         test_milestones,
         test_winback_eligibility,

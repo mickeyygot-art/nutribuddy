@@ -117,6 +117,27 @@ def get_meal_dates(user_id: str, days: int = 45) -> list:
     return [r["logged_at"] for r in rows]
 
 
+def get_recent_meals(user_id: str, limit: int = 20) -> list:
+    """YOL-59: most recent meals (newest first) for the profile-learning pass."""
+    return (
+        supabase.table("meals")
+        .select("description, meal_type, logged_at")
+        .eq("user_id", user_id)
+        .order("logged_at", desc=True)
+        .limit(limit)
+        .execute()
+        .data
+    )
+
+
+def update_user_profile(user_id: str, profile: str):
+    """YOL-59: store the learned coaching profile + refresh timestamp."""
+    supabase.table("users").update({
+        "coaching_profile": profile,
+        "profile_updated_at": datetime.now(timezone.utc).isoformat(),
+    }).eq("id", user_id).execute()
+
+
 # ── MEALS ─────────────────────────────────────────────────────────────────────
 
 def _meal_type_from_time() -> str:
