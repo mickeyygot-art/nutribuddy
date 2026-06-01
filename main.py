@@ -12,10 +12,13 @@ from linebot.v3 import WebhookHandler
 from linebot.v3.messaging import (
     Configuration, ApiClient, MessagingApi, MessagingApiBlob,
     ReplyMessageRequest, PushMessageRequest, TextMessage,
+    FlexMessage, FlexContainer,
 )
 from linebot.v3.webhooks import (
-    MessageEvent, TextMessageContent, ImageMessageContent, AudioMessageContent, FollowEvent,
+    MessageEvent, TextMessageContent, ImageMessageContent, AudioMessageContent,
+    FollowEvent, PostbackEvent,
 )
+import urllib.parse
 from linebot.v3.exceptions import InvalidSignatureError
 import anthropic
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -193,6 +196,35 @@ GOAL_LABEL = {
     "no_goal":      "ยังไม่มีเป้าหมายเฉพาะ / no specific goal",
 }
 
+# YOL-63: short Thai labels for the Flex goal buttons (LINE button label cap = 20 chars)
+GOAL_BUTTON_LABEL = {
+    "lose_weight":  "🥗 ลดน้ำหนัก",
+    "eat_clean":    "🌿 กินคลีน",
+    "build_muscle": "💪 เพิ่มกล้ามเนื้อ",
+    "no_goal":      "✨ ยังไม่มีเป้าหมาย",
+}
+
+# YOL-63: warm, goal-specific, personalized confirmation after a goal tap. {name} optional.
+GOAL_CONFIRM_TH = {
+    "lose_weight":  "เยี่ยมเลย{name}! ตั้งเป้าหมายลดน้ำหนักให้แล้ว 🥑 ส่งรูปมื้อแรกมาได้เลย",
+    "eat_clean":    "ดีมากเลย{name}! เป้าหมายกินคลีนพร้อมแล้ว 🥗 ส่งมื้อแรกมาดูกันเลย",
+    "build_muscle": "สุดยอด{name}! ตั้งเป้าเพิ่มกล้ามเนื้อแล้ว 💪 ส่งมื้อแรกมาได้เลย",
+    "no_goal":      "ยังไม่มีเป้าหมายก็ไม่เป็นไรเลย{name} — แค่อยากกินอย่างมีสติก็เริ่มได้ 🌿",
+}
+GOAL_CONFIRM_EN = {
+    "lose_weight":  "Awesome{name}! Lose-weight goal is set 🥑 Send me your first meal anytime",
+    "eat_clean":    "Love it{name}! Eat-clean goal is ready 🥗 Send your first meal and let's see",
+    "build_muscle": "Great{name}! Build-muscle goal is set 💪 Send me your first meal anytime",
+    "no_goal":      "No goal yet is perfectly fine{name} — just eating a little more mindfully is a great start 🌿",
+}
+
+# YOL-64: re-open the goal card on demand. Kept explicit so coaching questions that merely
+# mention "goal" (e.g. "is this good for my goal?") don't hijack into the menu.
+GOAL_MENU_KEYWORDS = {
+    "เปลี่ยนเป้าหมาย", "ตั้งเป้าหมาย", "เลือกเป้าหมาย", "เมนูเป้าหมาย",
+    "change goal", "change my goal", "set goal", "set my goal", "goal menu",
+}
+
 SYSTEM_PROMPT = """You are NutriBuddy, a friendly health coach on LINE for Thai users.
 
 FORMATTING — LINE does not support markdown. Violating these will break the message:
@@ -240,6 +272,69 @@ def detect_goal(text: str) -> str | None:
         if key in t:
             return goal
     return None
+
+
+def is_goal_menu_request(text: str) -> bool:
+    """YOL-64: True if the user wants to (re)open the goal card."""
+    t = text.lower().strip()
+    return any(kw in t for kw in GOAL_MENU_KEYWORDS)
+
+
+def parse_postback(data: str) -> dict:
+    """YOL-63: parse a postback querystring like 'action=set_goal&goal=lose_weight'."""
+    try:
+        return {k: v[0] for k, v in urllib.parse.parse_qs(data or "").items()}
+    except Exception:
+        return {}
+
+
+def build_journey_flex(display_name: str = "", current_goal: str | None = None) -> dict:
+    """YOL-63: bilingual onboarding journey bubble that doubles as the goal selector.
+    Footer buttons are postback actions (clean chat; stable goal enum in payload)."""
+    name = f" {display_name}" if display_name else ""
+    greeting = f"สวัสดี{name}! 🥑"
+    sub = "มาเริ่มต้นดูแลมื้ออาหารไปด้วยกัน / Let's build healthier habits together"
+    steps = [
+        "➕ เพิ่มเพื่อน / Add NutriBuddy",
+        "🎯 ตั้งเป้าหมาย / Set your goal",
+        "📷 บันทึกมื้อ — ถ่าย พิมพ์ หรือพูด / Log a meal — snap, type, or say it",
+        "💬 รับคำแนะนำทันที / Instant coaching",
+        "📊 สรุปรายวัน & รายสัปดาห์ / Daily & weekly check-ins",
+        "🌿 สุขภาพดีขึ้นทีละนิด / Healthier habits, gently",
+    ]
+    body_contents = [
+        {"type": "text", "text": greeting, "weight": "bold", "size": "xl", "color": "#16a34a"},
+        {"type": "text", "text": sub, "size": "sm", "color": "#888888", "wrap": True, "margin": "sm"},
+    ]
+    if current_goal:
+        body_contents.append({
+            "type": "text", "margin": "md", "size": "sm", "color": "#16a34a", "wrap": True,
+            "text": f"เป้าหมายตอนนี้ / Current goal: {GOAL_LABEL.get(current_goal, current_goal)}",
+        })
+    body_contents.append({"type": "separator", "margin": "lg"})
+    for s in steps:
+        body_contents.append({"type": "text", "text": s, "size": "sm", "wrap": True, "margin": "md", "color": "#333333"})
+    body_contents.append({"type": "separator", "margin": "lg"})
+    body_contents.append({
+        "type": "text", "text": "เลือกเป้าหมายของคุณ / Choose your goal",
+        "weight": "bold", "size": "md", "margin": "lg", "wrap": True,
+    })
+
+    buttons = [{
+        "type": "button", "style": "primary" if g == "lose_weight" else "secondary",
+        "color": "#16a34a" if g == "lose_weight" else None, "height": "sm", "margin": "sm",
+        "action": {"type": "postback", "label": GOAL_BUTTON_LABEL[g], "data": f"action=set_goal&goal={g}"},
+    } for g in ("lose_weight", "eat_clean", "build_muscle", "no_goal")]
+    # strip None color keys (LINE rejects null)
+    for b in buttons:
+        if b.get("color") is None:
+            b.pop("color", None)
+
+    return {
+        "type": "bubble",
+        "body": {"type": "box", "layout": "vertical", "contents": body_contents},
+        "footer": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": buttons},
+    }
 
 
 def clean_for_line(text: str) -> str:
@@ -686,6 +781,26 @@ def _push(line_user_id: str, text: str):
         )
 
 
+def _reply_flex(reply_token: str, alt_text: str, bubble: dict):
+    """YOL-63: reply with a Flex bubble."""
+    with ApiClient(configuration) as api_client:
+        MessagingApi(api_client).reply_message(
+            ReplyMessageRequest(reply_token=reply_token, messages=[
+                FlexMessage(alt_text=alt_text, contents=FlexContainer.from_dict(bubble))
+            ])
+        )
+
+
+def _display_name(line_user_id: str) -> str:
+    """YOL-63: fetch the LINE display name for a personalized greeting. Not stored (no PII)."""
+    try:
+        with ApiClient(configuration) as api_client:
+            return MessagingApi(api_client).get_profile(line_user_id).display_name or ""
+    except Exception as e:
+        print(f"display_name fetch error: {e}")
+        return ""
+
+
 def transcribe_audio(audio_bytes: bytes, duration_ms: int = 0) -> str | None:
     """YOL-62: transcribe a LINE voice note (m4a) via Google Speech-to-Text.
     Transcodes m4a→FLAC with ffmpeg first (Google STT doesn't accept AAC). Returns
@@ -747,12 +862,64 @@ async def webhook(request: Request):
 
 # ── FOLLOW (onboarding) ───────────────────────────────────────────────────────
 
+def _apply_goal(user: dict, line_user_id: str, goal: str, lang: str) -> str:
+    """Set the goal, fire analytics, return a warm goal-specific confirmation. Shared by
+    the text path and the Flex postback (YOL-63)."""
+    is_initial = user.get("goal") == "no_goal"
+    update_user_goal(line_user_id, goal)
+    user["goal"] = goal
+    try:
+        tracking.track_goal_set(
+            line_user_id, goal=goal,
+            previous_goal=user.get("goal") if not is_initial else None,
+            is_initial_set=is_initial, set_method="flex_postback",
+        )
+        tracking.identify_user(line_user_id, goal=goal, language=lang)
+    except Exception as e:
+        print(f"Analytics error (goal.set): {e}")
+    table = GOAL_CONFIRM_TH if lang == "th" else GOAL_CONFIRM_EN
+    return table.get(goal, table["no_goal"])
+
+
+@handler.add(PostbackEvent)
+def handle_postback(event):
+    """YOL-63: handle Flex goal-button taps (postback). Always confirm warmly — a postback
+    shows nothing in the chat, so a silent state change would be confusing."""
+    line_user_id = event.source.user_id
+    user = get_or_create_user(line_user_id)
+    try:
+        update_last_active(user["id"])
+    except Exception:
+        pass
+    data = parse_postback(event.postback.data)
+    action = data.get("action")
+    if action == "set_goal" and data.get("goal") in GOAL_LABEL:
+        lang = user.get("language", "th")
+        name = _display_name(line_user_id)
+        confirm = _apply_goal(user, line_user_id, data["goal"], lang)
+        confirm = confirm.format(name=(f" {name}" if name else ""))
+        _reply(event.reply_token, confirm)
+    elif action == "open_goal_menu":  # YOL-64: Rich Menu button
+        bubble = build_journey_flex(_display_name(line_user_id), current_goal=user.get("goal"))
+        try:
+            _reply_flex(event.reply_token, "เลือกเป้าหมายของคุณ / Choose your goal", bubble)
+        except Exception as e:
+            print(f"Goal menu flex error: {e}")
+
+
 @handler.add(FollowEvent)
 def handle_follow(event):
     user = get_or_create_user(event.source.user_id)
-    _reply(event.reply_token, ONBOARDING_MSG_1)
-    time.sleep(1)
-    _push(event.source.user_id, ONBOARDING_MSG_2)
+    # YOL-63: personalized bilingual journey card that doubles as the goal selector.
+    try:
+        name = _display_name(event.source.user_id)
+        bubble = build_journey_flex(name)
+        _reply_flex(event.reply_token, "ยินดีต้อนรับสู่ NutriBuddy! เลือกเป้าหมายของคุณ", bubble)
+    except Exception as e:
+        print(f"Onboarding flex error: {e}")  # fall back to text onboarding (YOL-26)
+        _reply(event.reply_token, ONBOARDING_MSG_1)
+        time.sleep(1)
+        _push(event.source.user_id, ONBOARDING_MSG_2)
     # YOL-45: analytics — user.joined
     try:
         tracking.track_user_joined(event.source.user_id)
@@ -855,6 +1022,17 @@ def process_text(event, user: dict, text: str):
         msg = (f"บันทึกเป้าหมายใหม่แล้วนะ: {label} 💪"
                if lang == "th" else f"Goal updated: {label} 💪")
         _reply(event.reply_token, msg)
+        return
+
+    # YOL-64: re-open the goal card on demand (keyword path; Rich Menu uses a postback)
+    if is_goal_menu_request(text):
+        try:
+            bubble = build_journey_flex(_display_name(line_user_id), current_goal=user.get("goal"))
+            _reply_flex(event.reply_token, "เลือกเป้าหมายของคุณ / Choose your goal", bubble)
+        except Exception as e:
+            print(f"Goal menu flex error: {e}")
+            _reply(event.reply_token,
+                   "บอกเป้าหมายได้เลยนะ: ลดน้ำหนัก / กินคลีน / เพิ่มกล้ามเนื้อ / ยังไม่มีเป้าหมาย")
         return
 
     # YOL-33: In-chat dashboard — always valid, checked before off-topic classifier

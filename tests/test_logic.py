@@ -844,6 +844,45 @@ def clamp_energy(e):
     return e if isinstance(e, int) and 1 <= e <= 5 else None
 
 
+def parse_postback(data):
+    """Pure mirror of main.parse_postback (YOL-63)."""
+    import urllib.parse
+    try:
+        return {k: v[0] for k, v in urllib.parse.parse_qs(data or "").items()}
+    except Exception:
+        return {}
+
+
+def is_goal_menu_request(text):
+    """Pure mirror of main.is_goal_menu_request (YOL-64)."""
+    GOAL_MENU_KEYWORDS = {
+        "เปลี่ยนเป้าหมาย", "ตั้งเป้าหมาย", "เลือกเป้าหมาย", "เมนูเป้าหมาย",
+        "change goal", "change my goal", "set goal", "set my goal", "goal menu",
+    }
+    t = text.lower().strip()
+    return any(kw in t for kw in GOAL_MENU_KEYWORDS)
+
+
+def test_postback_parsing():
+    print("=== Postback parsing (YOL-63) ===")
+    d = parse_postback("action=set_goal&goal=lose_weight")
+    run("action parsed", d.get("action") == "set_goal")
+    run("goal parsed", d.get("goal") == "lose_weight")
+    run("open_goal_menu parsed", parse_postback("action=open_goal_menu").get("action") == "open_goal_menu")
+    run("empty → {}", parse_postback("") == {})
+    run("garbage → no action", parse_postback("just junk").get("action") is None)
+
+
+def test_goal_menu_intent():
+    print("=== Goal menu intent (YOL-64) ===")
+    run("'เปลี่ยนเป้าหมาย' → menu", is_goal_menu_request("เปลี่ยนเป้าหมาย"))
+    run("'change goal' → menu", is_goal_menu_request("I want to change goal"))
+    run("'set my goal' → menu", is_goal_menu_request("set my goal please"))
+    # must NOT hijack coaching questions that merely mention 'goal'
+    run("'is this good for my goal?' → not menu", not is_goal_menu_request("is this good for my goal?"))
+    run("'กินอะไรดี' → not menu", not is_goal_menu_request("กินอะไรดี"))
+
+
 def test_checkin_pending():
     print("=== Check-in pending window (YOL-60) ===")
     from datetime import datetime, timezone, timedelta
@@ -1061,6 +1100,8 @@ if __name__ == "__main__":
         test_cap_history_date,
         test_transactional_history,
         test_tracking_guard,
+        test_postback_parsing,
+        test_goal_menu_intent,
         test_checkin_pending,
         test_checkin_energy_clamp,
         test_profile_staleness,
