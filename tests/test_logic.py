@@ -863,6 +863,48 @@ def is_goal_menu_request(text):
     return any(kw in t for kw in GOAL_MENU_KEYWORDS)
 
 
+def build_month_stats(meals):
+    """Pure mirror of main.build_month_stats (YOL-68). Uses date[:10] as a stand-in for bkk_date_key."""
+    from collections import Counter
+    counts = Counter(m["description"] for m in meals)
+    return {
+        "total_meals": len(meals),
+        "distinct_dishes": len(counts),
+        "days_logged": len({m["logged_at"][:10] for m in meals}),
+        "top_dishes": [d for d, _ in counts.most_common(3)],
+    }
+
+
+def onboarding_lang(stored_lang):
+    """Pure mirror of _onboarding_* selection (YOL-69): EN only if stored 'en', else Thai."""
+    return "en" if stored_lang == "en" else "th"
+
+
+def test_month_stats():
+    print("=== Wrapped month stats (YOL-68) ===")
+    meals = [
+        {"description": "ข้าวมันไก่", "logged_at": "2026-05-02T08:00:00Z"},
+        {"description": "ข้าวมันไก่", "logged_at": "2026-05-02T12:00:00Z"},
+        {"description": "ส้มตำ", "logged_at": "2026-05-03T12:00:00Z"},
+        {"description": "ผัดไทย", "logged_at": "2026-05-04T12:00:00Z"},
+    ]
+    s = build_month_stats(meals)
+    run("total meals", s["total_meals"] == 4)
+    run("distinct dishes", s["distinct_dishes"] == 3)
+    run("days logged (2 same-day merged)", s["days_logged"] == 3)
+    run("top dish is ข้าวมันไก่", s["top_dishes"][0] == "ข้าวมันไก่")
+    empty = build_month_stats([])
+    run("empty → zeros", empty["total_meals"] == 0 and empty["top_dishes"] == [])
+
+
+def test_onboarding_language():
+    print("=== Thai-default onboarding language (YOL-69) ===")
+    run("default (th) → th", onboarding_lang("th") == "th")
+    run("new user (None) → th", onboarding_lang(None) == "th")
+    run("unknown → th (Thai-first)", onboarding_lang("xx") == "th")
+    run("stored en → en", onboarding_lang("en") == "en")
+
+
 def test_postback_parsing():
     print("=== Postback parsing (YOL-63) ===")
     d = parse_postback("action=set_goal&goal=lose_weight")
@@ -1129,6 +1171,8 @@ if __name__ == "__main__":
         test_cap_history_date,
         test_transactional_history,
         test_tracking_guard,
+        test_month_stats,
+        test_onboarding_language,
         test_postback_parsing,
         test_goal_menu_intent,
         test_checkin_pending,

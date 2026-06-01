@@ -33,6 +33,7 @@ from database import (
     get_lapsed_users, mark_winback_sent, get_meal_count, get_meal_dates,
     compute_streak, bkk_date_key, get_recent_meals, update_user_profile,
     set_checkin_pending, clear_checkin_pending, insert_checkin, get_recent_checkins,
+    get_month_meals,
 )
 import subprocess
 import tempfile
@@ -56,17 +57,25 @@ BKK = pytz.timezone("Asia/Bangkok")
 
 # ── COPY ──────────────────────────────────────────────────────────────────────
 
-ONBOARDING_MSG_1 = """สวัสดี! ฉันคือ NutriBuddy เพื่อนด้านสุขภาพของคุณบน LINE 🥑
+# YOL-69: onboarding is single-language. New users default to Thai (DB default);
+# the EN strings are served only to users whose stored language is already 'en'.
+ONBOARDING_MSG_1_TH = """สวัสดี! ฉันคือ NutriBuddy เพื่อนด้านสุขภาพของคุณบน LINE 🥑
 
 ก่อนเริ่ม — เป้าหมายของคุณคืออะไร?
 1️⃣ ลดน้ำหนัก
 2️⃣ กินอาหารคลีนมากขึ้น
 3️⃣ เพิ่มกล้ามเนื้อ
-4️⃣ ยังไม่มีเป้าหมาย ขอแค่รู้ว่ากินอะไรอยู่
+4️⃣ ยังไม่มีเป้าหมาย ขอแค่รู้ว่ากินอะไรอยู่"""
 
-(You can also chat with me in English anytime!)"""
+ONBOARDING_MSG_1_EN = """Hi! I'm NutriBuddy, your health buddy on LINE 🥑
 
-ONBOARDING_MSG_2 = """นี่คือสิ่งที่ NutriBuddy ทำได้
+To start — what's your goal?
+1️⃣ Lose weight
+2️⃣ Eat cleaner
+3️⃣ Build muscle
+4️⃣ No goal yet, just want to see what I'm eating"""
+
+ONBOARDING_MSG_2_TH = """นี่คือสิ่งที่ NutriBuddy ทำได้
 
 ส่งรูปอาหาร — ฉันจะบอกว่าโภชนาการเป็นยังไงและมีคำแนะนำสำหรับมื้อต่อไป
 บอกชื่อเมนู — พิมพ์หรือส่งเสียงก็ได้ ไม่ต้องมีรูปเสมอไป
@@ -74,6 +83,18 @@ ONBOARDING_MSG_2 = """นี่คือสิ่งที่ NutriBuddy ทำ�
 เปลี่ยนเป้าหมาย — พิมพ์ "เปลี่ยนเป้าหมาย" ได้ตลอดเวลา
 สรุปรายวัน — ทุกคืน 20.00 น. ฉันจะส่งสรุปมื้ออาหารวันนี้ให้
 สรุปรายสัปดาห์ — ทุกวันจันทร์ 8.00 น. ฉันจะส่งภาพรวมของสัปดาห์ที่ผ่านมา"""
+
+ONBOARDING_MSG_2_EN = """Here's what NutriBuddy can do
+
+Send a food photo — I'll tell you how it looks nutritionally, with a tip for next time
+Say a dish — type or send a voice note, no photo needed
+Ask your history — "what did I eat this morning?" or "what did I eat yesterday?"
+Change your goal — type "change goal" anytime
+Daily recap — every night at 8pm I'll sum up today's meals
+Weekly recap — every Monday 8am I'll send your week in review"""
+
+def _onboarding_1(lang): return ONBOARDING_MSG_1_EN if lang == "en" else ONBOARDING_MSG_1_TH
+def _onboarding_2(lang): return ONBOARDING_MSG_2_EN if lang == "en" else ONBOARDING_MSG_2_TH
 
 BLOCKED_TH = "NutriBuddy พักอยู่ 6 ชั่วโมงนะ กลับมาคุยเรื่องอาหารด้วยกันทีหลังได้เลย 🌿"
 BLOCKED_EN = "NutriBuddy is resting for 6 hours. Come back and let's talk food! 🌿"
@@ -196,12 +217,18 @@ GOAL_LABEL = {
     "no_goal":      "ยังไม่มีเป้าหมายเฉพาะ / no specific goal",
 }
 
-# YOL-63: short Thai labels for the Flex goal buttons (LINE button label cap = 20 chars)
+# YOL-63: short labels for the Flex goal buttons (LINE button label cap = 20 chars). YOL-69: per-language.
 GOAL_BUTTON_LABEL = {
     "lose_weight":  "🥗 ลดน้ำหนัก",
     "eat_clean":    "🌿 กินคลีน",
     "build_muscle": "💪 เพิ่มกล้ามเนื้อ",
     "no_goal":      "✨ ยังไม่มีเป้าหมาย",
+}
+GOAL_BUTTON_LABEL_EN = {
+    "lose_weight":  "🥗 Lose weight",
+    "eat_clean":    "🌿 Eat clean",
+    "build_muscle": "💪 Build muscle",
+    "no_goal":      "✨ Just exploring",
 }
 
 # YOL-63: warm, goal-specific, personalized confirmation after a goal tap. {name} optional.
@@ -288,50 +315,109 @@ def parse_postback(data: str) -> dict:
         return {}
 
 
-def build_journey_flex(display_name: str = "", current_goal: str | None = None) -> dict:
-    """YOL-63: bilingual onboarding journey bubble that doubles as the goal selector.
+def build_journey_flex(display_name: str = "", current_goal: str | None = None, lang: str = "th") -> dict:
+    """YOL-63/69: single-language onboarding journey bubble that doubles as the goal selector.
     Footer buttons are postback actions (clean chat; stable goal enum in payload)."""
     name = f" {display_name}" if display_name else ""
-    greeting = f"สวัสดี{name}! 🥑"
-    sub = "มาเริ่มต้นดูแลมื้ออาหารไปด้วยกัน / Let's build healthier habits together"
+    th = lang != "en"
+    greeting = f"สวัสดี{name}! 🥑" if th else f"Hi{name}! 🥑"
+    sub = "มาเริ่มต้นดูแลมื้ออาหารไปด้วยกัน" if th else "Let's build healthier habits together"
     steps = [
-        "➕ เพิ่มเพื่อน / Add NutriBuddy",
-        "🎯 ตั้งเป้าหมาย / Set your goal",
-        "📷 บันทึกมื้อ — ถ่าย พิมพ์ หรือพูด / Log a meal — snap, type, or say it",
-        "💬 รับคำแนะนำทันที / Instant coaching",
-        "📊 สรุปรายวัน & รายสัปดาห์ / Daily & weekly check-ins",
-        "🌿 สุขภาพดีขึ้นทีละนิด / Healthier habits, gently",
+        "➕ เพิ่มเพื่อน NutriBuddy", "🎯 ตั้งเป้าหมายของคุณ",
+        "📷 บันทึกมื้อ — ถ่าย พิมพ์ หรือพูด", "💬 รับคำแนะนำทันที",
+        "📊 สรุปรายวันและรายสัปดาห์", "🌿 สุขภาพดีขึ้นทีละนิด",
+    ] if th else [
+        "➕ Add NutriBuddy", "🎯 Set your goal",
+        "📷 Log a meal — snap, type, or say it", "💬 Instant coaching",
+        "📊 Daily & weekly recaps", "🌿 Healthier habits, gently",
     ]
+    choose = "เลือกเป้าหมายของคุณ" if th else "Choose your goal"
+    labels = GOAL_BUTTON_LABEL if th else GOAL_BUTTON_LABEL_EN
+
     body_contents = [
         {"type": "text", "text": greeting, "weight": "bold", "size": "xl", "color": "#16a34a"},
         {"type": "text", "text": sub, "size": "sm", "color": "#888888", "wrap": True, "margin": "sm"},
     ]
     if current_goal:
+        cur = "เป้าหมายตอนนี้" if th else "Current goal"
         body_contents.append({
             "type": "text", "margin": "md", "size": "sm", "color": "#16a34a", "wrap": True,
-            "text": f"เป้าหมายตอนนี้ / Current goal: {GOAL_LABEL.get(current_goal, current_goal)}",
+            "text": f"{cur}: {GOAL_LABEL.get(current_goal, current_goal)}",
         })
     body_contents.append({"type": "separator", "margin": "lg"})
     for s in steps:
         body_contents.append({"type": "text", "text": s, "size": "sm", "wrap": True, "margin": "md", "color": "#333333"})
     body_contents.append({"type": "separator", "margin": "lg"})
-    body_contents.append({
-        "type": "text", "text": "เลือกเป้าหมายของคุณ / Choose your goal",
-        "weight": "bold", "size": "md", "margin": "lg", "wrap": True,
-    })
+    body_contents.append({"type": "text", "text": choose, "weight": "bold", "size": "md", "margin": "lg", "wrap": True})
 
     # All four goals are equal first-class options — identical styling so none looks
-    # pre-selected. The selected goal is reflected in the header on re-open, plus the
-    # warm confirmation reply (a sent Flex card can't re-highlight after a tap).
+    # pre-selected. The selected goal is reflected in the header on re-open + the reply.
     buttons = [{
         "type": "button", "style": "secondary", "height": "sm", "margin": "sm",
-        "action": {"type": "postback", "label": GOAL_BUTTON_LABEL[g], "data": f"action=set_goal&goal={g}"},
+        "action": {"type": "postback", "label": labels[g], "data": f"action=set_goal&goal={g}"},
     } for g in ("lose_weight", "eat_clean", "build_muscle", "no_goal")]
 
     return {
         "type": "bubble",
         "body": {"type": "box", "layout": "vertical", "contents": body_contents},
         "footer": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": buttons},
+    }
+
+
+def build_month_stats(meals: list) -> dict:
+    """YOL-68: meal-derived stats for the Wrapped recap (pure; streak/outcome added by caller)."""
+    from collections import Counter
+    counts = Counter(m["description"] for m in meals)
+    return {
+        "total_meals": len(meals),
+        "distinct_dishes": len(counts),
+        "days_logged": len({bkk_date_key(m["logged_at"]) for m in meals}),
+        "top_dishes": [d for d, _ in counts.most_common(3)],
+    }
+
+
+def build_wrapped_flex(stats: dict, streak: int, takeaway: str, lang: str = "th") -> dict:
+    """YOL-68: shareable 'Your Food Month' recap bubble (single-language per YOL-69)."""
+    th = lang != "en"
+    title = "สรุปอาหารเดือนนี้ 🥑" if th else "Your Food Month 🥑"
+    L = {
+        "dishes": "เมนูที่ลอง" if th else "dishes tried",
+        "days": "วันที่บันทึก" if th else "days logged",
+        "streak": "ต่อเนื่องสูงสุด" if th else "streak",
+        "unit_day": "วัน" if th else "days",
+        "fav": "เมนูเด็ดของเดือนนี้" if th else "Your top dishes",
+        "share": "กดค้างที่การ์ดเพื่อส่งต่อให้เพื่อน 💚" if th else "Long-press this card to share with a friend 💚",
+    }
+
+    def stat_row(num, label):
+        return {"type": "box", "layout": "vertical", "flex": 1, "contents": [
+            {"type": "text", "text": str(num), "size": "xxl", "weight": "bold", "color": "#16a34a", "align": "center"},
+            {"type": "text", "text": label, "size": "xs", "color": "#888888", "align": "center", "wrap": True},
+        ]}
+
+    body = [
+        {"type": "text", "text": title, "weight": "bold", "size": "lg", "color": "#16a34a", "wrap": True},
+        {"type": "box", "layout": "horizontal", "margin": "lg", "contents": [
+            stat_row(stats["distinct_dishes"], L["dishes"]),
+            stat_row(stats["days_logged"], L["days"]),
+            stat_row(f'{streak} {L["unit_day"]}', L["streak"]),
+        ]},
+    ]
+    if stats["top_dishes"]:
+        body.append({"type": "separator", "margin": "lg"})
+        body.append({"type": "text", "text": L["fav"], "weight": "bold", "size": "sm", "margin": "lg", "color": "#333333"})
+        for i, d in enumerate(stats["top_dishes"], 1):
+            body.append({"type": "text", "text": f"{i}. {d}", "size": "sm", "margin": "sm", "wrap": True})
+    if takeaway:
+        body.append({"type": "separator", "margin": "lg"})
+        body.append({"type": "text", "text": takeaway, "size": "sm", "margin": "lg", "wrap": True, "color": "#333333"})
+
+    return {
+        "type": "bubble",
+        "body": {"type": "box", "layout": "vertical", "contents": body},
+        "footer": {"type": "box", "layout": "vertical", "contents": [
+            {"type": "text", "text": L["share"], "size": "xs", "color": "#16a34a", "align": "center", "wrap": True}
+        ]},
     }
 
 
@@ -795,6 +881,16 @@ def _reply_flex(reply_token: str, alt_text: str, bubble: dict):
         )
 
 
+def _push_flex(line_user_id: str, alt_text: str, bubble: dict):
+    """YOL-68: push a Flex bubble (scheduled recap)."""
+    with ApiClient(configuration) as api_client:
+        MessagingApi(api_client).push_message(
+            PushMessageRequest(to=line_user_id, messages=[
+                FlexMessage(alt_text=alt_text, contents=FlexContainer.from_dict(bubble))
+            ])
+        )
+
+
 def _display_name(line_user_id: str) -> str:
     """YOL-63: fetch the LINE display name for a personalized greeting. Not stored (no PII)."""
     try:
@@ -904,9 +1000,10 @@ def handle_postback(event):
         confirm = confirm.format(name=(f" {name}" if name else ""))
         _reply(event.reply_token, confirm)
     elif action == "open_goal_menu":  # YOL-64: Rich Menu button
-        bubble = build_journey_flex(_display_name(line_user_id), current_goal=user.get("goal"))
+        lang = user.get("language", "th")
+        bubble = build_journey_flex(_display_name(line_user_id), current_goal=user.get("goal"), lang=lang)
         try:
-            _reply_flex(event.reply_token, "เลือกเป้าหมายของคุณ / Choose your goal", bubble)
+            _reply_flex(event.reply_token, "เลือกเป้าหมายของคุณ" if lang != "en" else "Choose your goal", bubble)
         except Exception as e:
             print(f"Goal menu flex error: {e}")
 
@@ -914,18 +1011,20 @@ def handle_postback(event):
 @handler.add(FollowEvent)
 def handle_follow(event):
     user = get_or_create_user(event.source.user_id)
-    # YOL-63: personalized bilingual journey card that doubles as the goal selector.
+    lang = user.get("language", "th")  # YOL-69: new users default Thai (DB default)
+    # YOL-63: personalized single-language journey card that doubles as the goal selector.
     try:
         name = _display_name(event.source.user_id)
-        bubble = build_journey_flex(name)
-        _reply_flex(event.reply_token, "ยินดีต้อนรับสู่ NutriBuddy! เลือกเป้าหมายของคุณ", bubble)
+        bubble = build_journey_flex(name, lang=lang)
+        alt = "ยินดีต้อนรับสู่ NutriBuddy! เลือกเป้าหมายของคุณ" if lang != "en" else "Welcome to NutriBuddy! Choose your goal"
+        _reply_flex(event.reply_token, alt, bubble)
         time.sleep(1)
-        _push(event.source.user_id, ONBOARDING_MSG_2)  # capabilities + how to re-open goal menu
+        _push(event.source.user_id, _onboarding_2(lang))  # capabilities + how to re-open goal menu
     except Exception as e:
         print(f"Onboarding flex error: {e}")  # fall back to text onboarding (YOL-26)
-        _reply(event.reply_token, ONBOARDING_MSG_1)
+        _reply(event.reply_token, _onboarding_1(lang))
         time.sleep(1)
-        _push(event.source.user_id, ONBOARDING_MSG_2)
+        _push(event.source.user_id, _onboarding_2(lang))
     # YOL-45: analytics — user.joined
     try:
         tracking.track_user_joined(event.source.user_id)
@@ -1033,12 +1132,13 @@ def process_text(event, user: dict, text: str):
     # YOL-64: re-open the goal card on demand (keyword path; Rich Menu uses a postback)
     if is_goal_menu_request(text):
         try:
-            bubble = build_journey_flex(_display_name(line_user_id), current_goal=user.get("goal"))
-            _reply_flex(event.reply_token, "เลือกเป้าหมายของคุณ / Choose your goal", bubble)
+            bubble = build_journey_flex(_display_name(line_user_id), current_goal=user.get("goal"), lang=lang)
+            _reply_flex(event.reply_token, "เลือกเป้าหมายของคุณ" if lang != "en" else "Choose your goal", bubble)
         except Exception as e:
             print(f"Goal menu flex error: {e}")
             _reply(event.reply_token,
-                   "บอกเป้าหมายได้เลยนะ: ลดน้ำหนัก / กินคลีน / เพิ่มกล้ามเนื้อ / ยังไม่มีเป้าหมาย")
+                   "บอกเป้าหมายได้เลยนะ: ลดน้ำหนัก / กินคลีน / เพิ่มกล้ามเนื้อ / ยังไม่มีเป้าหมาย"
+                   if lang != "en" else "Just tell me your goal: lose weight / eat clean / build muscle / no goal")
         return
 
     # YOL-33: In-chat dashboard — always valid, checked before off-topic classifier
@@ -1543,12 +1643,58 @@ def send_winback_nudges():
             print(f"Win-back error for {user.get('line_user_id')}: {e}")
 
 
+# ── MONTHLY WRAPPED RECAP (YOL-68) — 1st of month, 09:00 Bangkok = 02:00 UTC ──
+
+MONTHLY_QUIET_TH = "เดือนนี้เงียบไปนิดนะ 🌿 ไม่เป็นไรเลย เดือนหน้าเริ่มใหม่ด้วยกัน — ส่งมื้อแรกมาได้ทุกเมื่อ"
+MONTHLY_QUIET_EN = "A quiet month 🌿 That's totally okay — let's start fresh next month. Send me your first meal anytime"
+
+
+def send_monthly_recaps():
+    # PLAN (YOL-68): a shareable 'Your Food Month' Flex card per user.
+    #   No-shame: a quiet month gets a warm encouraging note, never a 'you failed' score.
+    for user in get_all_users():
+        try:
+            lang = user.get("language", "th")
+            line_user_id = user["line_user_id"]
+            meals = get_month_meals(user["id"], 30)
+
+            if not meals:
+                _push(line_user_id, MONTHLY_QUIET_TH if lang == "th" else MONTHLY_QUIET_EN)
+                continue
+
+            stats = build_month_stats(meals)
+            streak = compute_streak(
+                {bkk_date_key(x) for x in get_meal_dates(user["id"], 45)},
+                datetime.now(BKK).date(),
+            )
+            goal_label = GOAL_LABEL.get(user.get("goal", "no_goal"), "no specific goal")
+            lang_word = "Thai" if lang == "th" else "English"
+            takeaway = generate_complete(
+                f"Write ONE warm, personal sentence celebrating this user's food month. "
+                f"They tried {stats['distinct_dishes']} different dishes across {stats['days_logged']} days; "
+                f"favorites: {', '.join(stats['top_dishes'])}. Goal: {goal_label}. "
+                f"Celebrate variety, consistency, and effort — NEVER mention calories or 'failed' days, "
+                f"no numbers-as-judgment. Warm friend tone, reply in {lang_word}, end with 1 emoji.",
+                base_tokens=150, ceiling_tokens=300,
+            )
+            bubble = build_wrapped_flex(stats, streak, clean_for_line(takeaway), lang)
+            alt = "สรุปอาหารเดือนนี้ของคุณ 🥑" if lang == "th" else "Your food month 🥑"
+            _push_flex(line_user_id, alt, bubble)
+            try:
+                log_event(user["id"], "monthly_recap_sent")
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"Monthly recap error for {user.get('line_user_id')}: {e}")
+
+
 # ── SCHEDULER (20:00 Bangkok = 13:00 UTC) ─────────────────────────────────────
 
 scheduler = BackgroundScheduler(timezone=pytz.utc)
 scheduler.add_job(send_daily_summaries, "cron", hour=13, minute=0)
 scheduler.add_job(send_weekly_summaries, "cron", day_of_week="mon", hour=1, minute=0)
 scheduler.add_job(send_winback_nudges, "cron", hour=10, minute=0)  # 17:00 BKK
+scheduler.add_job(send_monthly_recaps, "cron", day=1, hour=2, minute=0)  # 1st, 09:00 BKK
 scheduler.start()
 
 
@@ -1748,4 +1894,14 @@ def trigger_winback(request: Request):
     if not expected or request.headers.get("X-Cron-Secret", "") != expected:
         raise HTTPException(status_code=403, detail="Forbidden")
     send_winback_nudges()
+    return {"status": "sent"}
+
+
+@app.post("/cron/monthly-recap")
+def trigger_monthly_recap(request: Request):
+    """Manual trigger for the Wrapped monthly recap — protected by CRON_SECRET header."""
+    expected = os.environ.get("CRON_SECRET", "")
+    if not expected or request.headers.get("X-Cron-Secret", "") != expected:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    send_monthly_recaps()
     return {"status": "sent"}

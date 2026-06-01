@@ -117,6 +117,20 @@ def get_meal_dates(user_id: str, days: int = 45) -> list:
     return [r["logged_at"] for r in rows]
 
 
+def get_month_meals(user_id: str, days: int = 30) -> list:
+    """YOL-68: all meals in the last `days` days (for the Wrapped recap)."""
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    return (
+        supabase.table("meals")
+        .select("description, meal_type, logged_at")
+        .eq("user_id", user_id)
+        .gte("logged_at", since)
+        .order("logged_at")
+        .execute()
+        .data
+    )
+
+
 def get_recent_meals(user_id: str, limit: int = 20) -> list:
     """YOL-59: most recent meals (newest first) for the profile-learning pass."""
     return (
