@@ -57,6 +57,7 @@
 
 <div id="error" class="hidden">
   <p>ไม่สามารถโหลดข้อมูลได้ — ลองใหม่อีกครั้ง</p>
+  <p id="errDetail" style="font-size:12px;color:#cbd5e1;margin-top:-8px"></p>
   <button onclick="load()">ลองใหม่</button>
 </div>
 
@@ -126,23 +127,34 @@
       `</div>`).join('');
   }
 
+  function fail(detail) {
+    document.getElementById('errDetail').textContent = detail || '';
+    show('error');
+  }
+
   async function load() {
     show('loading');
     try {
       const token = liff.getAccessToken();
+      if (!token) { fail('no access token'); return; }
       const res = await fetch('/api/liff/meals', { headers: { Authorization: `Bearer ${token}` } });
-      if (!res.ok) throw new Error('http ' + res.status);
+      if (!res.ok) {
+        let detail = '';
+        try { detail = (await res.json()).detail || ''; } catch (_) {}
+        fail(`${res.status}${detail ? ' · ' + detail : ''}`);
+        return;
+      }
       render(await res.json());
       show('content');
     } catch (e) {
-      show('error');
+      fail('network: ' + (e && e.message ? e.message : e));
     }
   }
 
   liff.init({ liffId: LIFF_ID }).then(() => {
     if (!liff.isLoggedIn()) { liff.login(); return; }
     load();
-  }).catch(() => show('error'));
+  }).catch((e) => fail('liff.init: ' + (e && e.message ? e.message : e)));
 </script>
 </body>
 </html>

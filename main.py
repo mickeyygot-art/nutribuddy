@@ -1028,9 +1028,13 @@ def liff_meals(request: Request):
         raise HTTPException(status_code=401, detail="Missing token")
     line_user_id = _liff_user_id(auth[7:].strip())
     if not line_user_id:
+        print("LIFF: token did not resolve to a userId (invalid token or missing profile scope)")
         raise HTTPException(status_code=401, detail="Invalid token")
     summary = get_liff_summary(line_user_id)
     if summary is None:
+        # userId valid but no matching users row — usually a provider mismatch between
+        # the LINE Login (LIFF) channel and the Messaging API bot channel.
+        print(f"LIFF: no users row for userId {line_user_id[:8]}… (provider mismatch or never onboarded)")
         raise HTTPException(status_code=401, detail="User not found")
     return summary
 
