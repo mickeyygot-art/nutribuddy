@@ -4,6 +4,7 @@ import json
 import base64
 import time
 import urllib.request
+import urllib.error
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request, HTTPException
@@ -991,13 +992,9 @@ def health():
 
 # ── LIFF DASHBOARD (YOL-50) ───────────────────────────────────────────────────
 
-def _liff_user_id(access_token: str) -> str | None:
-    """Validate a LIFF access token and return the LINE user ID, or None.
-
-    Note: LINE's /oauth2/v2.1/verify endpoint validates a token but does NOT
-    return the user ID. The Profile API both validates the token (401 on a bad
-    one) and returns userId, so we use it.
-    """
+def _line_profile(access_token: str):
+    """Call LINE's Profile API with a LIFF access token.
+    Returns (userId | None, http_status). status is -1 on a non-HTTP error."""
     try:
         req = urllib.request.Request(
             "https://api.line.me/v2/profile",
@@ -1005,10 +1002,23 @@ def _liff_user_id(access_token: str) -> str | None:
         )
         with urllib.request.urlopen(req, timeout=5) as r:
             data = json.loads(r.read().decode("utf-8"))
-        return data.get("userId")
+        return data.get("userId"), 200
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8")[:200]
+        except Exception:
+            pass
+        print(f"LIFF profile HTTPError {e.code}: {body}")
+        return None, e.code
     except Exception as e:
-        print(f"LIFF token verify error: {e}")
-        return None
+        print(f"LIFF profile error: {e}")
+        return None, -1
+
+
+def _liff_user_id(access_token: str) -> str | None:
+    uid, _ = _line_profile(access_token)
+    return uid
 
 
 @app.get("/liff")
@@ -1026,7 +1036,7 @@ def liff_whoami(request: Request):
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing token")
-    uid = _liff_user_id(auth[7:].strip())
+    uid, profile_status = _line_profile(auth[7:].strip())
     total = 0
     try:
         total = supabase.table("users").select("id", count="exact").execute().count or 0
@@ -1034,6 +1044,7 @@ def liff_whoami(request: Request):
         pass
     return {
         "token_resolved": bool(uid),
+        "profile_status": profile_status,
         "user_id_prefix": (uid[:10] + "…") if uid else None,
         "row_exists": (get_liff_summary(uid) is not None) if uid else False,
         "total_users": total,
