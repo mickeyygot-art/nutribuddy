@@ -127,8 +127,21 @@
       `</div>`).join('');
   }
 
-  function fail(detail) {
-    document.getElementById('errDetail').textContent = detail || '';
+  async function fail(detail) {
+    let extra = '';
+    try {
+      const token = liff.getAccessToken();
+      if (token) {
+        const w = await fetch('/api/liff/whoami', { headers: { Authorization: `Bearer ${token}` } });
+        if (w.ok) {
+          const j = await w.json();
+          extra = ` | resolved=${j.token_resolved} row=${j.row_exists} users=${j.total_users}`;
+        } else {
+          extra = ` | whoami ${w.status}`;
+        }
+      }
+    } catch (_) {}
+    document.getElementById('errDetail').textContent = (detail || '') + extra;
     show('error');
   }
 
