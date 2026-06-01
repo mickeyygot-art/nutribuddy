@@ -569,24 +569,30 @@ def summary_asks_question(seed: int) -> bool:
     return seed % 3 == 0
 
 
-def complete_narrative(text: str, lang: str) -> str:
-    """YOL-48/49: ensure the narrative is a whole thought — never truncated mid-sentence.
-    One continuation call if cut off; otherwise trim to the last complete sentence."""
-    if ends_complete(text):
-        return text.strip()
-    try:
-        cont = claude.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=100,
-            messages=[{"role": "user", "content":
-                "This message was cut off mid-sentence. Write ONLY the few words needed to finish "
-                f"the final sentence naturally — nothing else, no repetition.\n\n{text}"}],
+def was_truncated(stop_reason) -> bool:
+    """YOL-65: definitive truncation signal — the model was cut at max_tokens.
+    Replaces the unreliable Thai-particle heuristic for inferring completeness."""
+    return stop_reason == "max_tokens"
+
+
+def generate_complete(prompt: str, base_tokens: int, ceiling_tokens: int) -> str:
+    """YOL-65: generate text that is never cut mid-word (critical for Thai, which has no
+    spaces). Detects truncation via stop_reason and REGENERATES at a higher ceiling rather
+    than space-stitching a continuation (which stranded fragments like 'พรุ พรุ่งนี้').
+    Only trims to a boundary as a last resort if even the ceiling run is cut off."""
+    resp = claude.messages.create(
+        model="claude-sonnet-4-6", max_tokens=base_tokens,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    if was_truncated(resp.stop_reason):
+        resp = claude.messages.create(
+            model="claude-sonnet-4-6", max_tokens=ceiling_tokens,
+            messages=[{"role": "user", "content": prompt}],
         )
-        combined = f"{text.rstrip()} {cont.content[0].text.strip()}"
-    except Exception as e:
-        print(f"narrative continuation error: {e}")
-        combined = text
-    return trim_to_complete(combined) or combined.strip()
+    text = resp.content[0].text
+    if was_truncated(resp.stop_reason):  # still cut at the ceiling (rare) — last resort
+        text = trim_to_complete(text) or text
+    return text
 
 
 def is_suggestion_fresh(last_at_iso, now) -> bool:
@@ -1069,12 +1075,8 @@ Line 3: one sentence on missed meal types or eating pattern
 Line 4: one goal-relevant tip 🌿
 
 Rules: max 4 sentences, max 1 emoji at the end, plain text only, reply in {lang_word}."""
-        resp = claude.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=250,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        _reply(event.reply_token, resp.content[0].text)
+        # YOL-65: Thai-safe completion (stop_reason regeneration, no mid-word cut)
+        _reply(event.reply_token, generate_complete(prompt, base_tokens=400, ceiling_tokens=600))
         return
 
     # Single triage call (off-topic? meals? history date?) — replaces 4 Haiku calls.
@@ -1186,7 +1188,7 @@ Rules: max 4 sentences, max 1 emoji at the end, plain text only, reply in {lang_
     history = conversation_history.setdefault(line_user_id, [])
     resp = claude.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=300,
+        max_tokens=400,  # YOL-65: headroom so a 2-sentence Thai reply isn't cut mid-word
         system=system,
         messages=history + [{"role": "user", "content": text}],
     )
@@ -1244,7 +1246,7 @@ def handle_image(event):
 
     resp = claude.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=300,
+        max_tokens=400,  # YOL-65: Thai headroom for DISH line + coaching response
         system=SYSTEM_PROMPT.format(goal=goal_label) + profile_context(user.get("coaching_profile")),  # YOL-59
         messages=[{"role": "user", "content": [
             {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64}},
@@ -1400,13 +1402,9 @@ Part B: 2-3 sentences with the flavour of {angle}. Observe a pattern from today'
 Tone: data-light storyteller, warm friend, no numbers, no calories, no lecturing.
 Do NOT list the meals yourself. Plain text only, no markdown. Reply in {lang_word}."""
 
-            resp = claude.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=200,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            opener, narrative = split_opener_narrative(resp.content[0].text)
-            narrative = complete_narrative(narrative, lang)
+            # YOL-65: higher ceiling + stop_reason-based regeneration so Thai never cuts mid-word
+            raw = generate_complete(prompt, base_tokens=400, ceiling_tokens=700)
+            opener, narrative = split_opener_narrative(raw)
             if not opener or not ends_complete(opener):
                 opener = (f"วันนี้คุณบันทึกมา {n} มื้อนะ 🍽️" if lang == "th"
                           else f"You logged {n} meal(s) today 🍽️")
@@ -1482,13 +1480,9 @@ Part B: 2-3 sentences. Observe a weekly eating pattern, call out one positive th
 Tone: data-light storyteller, warm friend, no numbers, no calories, no lecturing.
 Do NOT list the dishes yourself. Plain text only, no markdown. Reply in {lang_word}."""
 
-            resp = claude.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=300,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            opener, narrative = split_opener_narrative(resp.content[0].text)
-            narrative = complete_narrative(narrative, lang)
+            # YOL-65: higher ceiling + stop_reason-based regeneration (Thai-safe)
+            raw = generate_complete(prompt, base_tokens=500, ceiling_tokens=800)
+            opener, narrative = split_opener_narrative(raw)
             if not opener or not ends_complete(opener):
                 opener = (f"สัปดาห์นี้คุณบันทึก {days} จาก 7 วัน 🌿" if lang == "th"
                           else f"You logged {days} of 7 days this week 🌿")

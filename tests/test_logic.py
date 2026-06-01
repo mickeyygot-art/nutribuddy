@@ -969,6 +969,35 @@ def test_summary_variation():
     run("question ~1 in 3 (seed 0)", asks(0) and not asks(1) and not asks(2))
 
 
+def was_truncated(stop_reason):
+    """Pure mirror of main.was_truncated (YOL-65)."""
+    return stop_reason == "max_tokens"
+
+
+def test_truncation_detection():
+    print("=== Truncation via stop_reason (YOL-65) ===")
+    run("max_tokens → truncated", was_truncated("max_tokens"))
+    run("end_turn → complete", not was_truncated("end_turn"))
+    run("stop_sequence → complete", not was_truncated("stop_sequence"))
+    run("None → complete", not was_truncated(None))
+    # Bug 1 regression: "รสจัดจ้า" ends in particle จ้า so ends_complete() FALSELY says complete,
+    # but stop_reason is the source of truth — a cut response is regenerated, not shipped.
+    run("Bug1: particle-ending fragment still flagged when cut",
+        ends_complete("วันนี้คุณชอบรสจัดจ้า") and was_truncated("max_tokens"))
+
+
+def test_no_fragment_stitch():
+    print("=== No stranded-fragment join (YOL-65 Bug 2) ===")
+    # trim_to_complete only SLICES its input — it can never insert a space to create
+    # 'พรุ พรุ่งนี้'. Output is always a prefix-substring of the stripped input.
+    src = "กินดีมากเลยวันนี้ พรุ"
+    out = trim_to_complete(src)
+    run("trim output is a substring of input (no inserted text)", out in src.rstrip())
+    run("no 'พรุ พรุ่งนี้' fragment pattern produced", "พรุ พรุ่งนี้" not in out)
+    # complete sentence is returned unchanged (no trimming when already complete)
+    run("complete Thai kept as-is", trim_to_complete("อร่อยมากเลยนะ") == "อร่อยมากเลยนะ")
+
+
 def test_sentence_completeness():
     print("=== Sentence completeness (YOL-48/49) ===")
     run("ends with . → complete", ends_complete("Add more veggies tomorrow."))
@@ -1110,6 +1139,8 @@ if __name__ == "__main__":
         test_milestones,
         test_winback_eligibility,
         test_summary_variation,
+        test_truncation_detection,
+        test_no_fragment_stitch,
         test_sentence_completeness,
         test_trim_to_complete,
         test_split_opener_narrative,
