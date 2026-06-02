@@ -231,6 +231,16 @@ GOAL_BUTTON_LABEL_EN = {
     "no_goal":      "✨ Just exploring",
 }
 
+# YOL-70: plain goal names (no emoji) for postback displayText + re-tap re-confirm
+GOAL_NAME_TH = {
+    "lose_weight": "ลดน้ำหนัก", "eat_clean": "กินคลีน",
+    "build_muscle": "เพิ่มกล้ามเนื้อ", "no_goal": "ยังไม่มีเป้าหมาย",
+}
+GOAL_NAME_EN = {
+    "lose_weight": "Lose weight", "eat_clean": "Eat clean",
+    "build_muscle": "Build muscle", "no_goal": "Just exploring",
+}
+
 # YOL-63: warm, goal-specific, personalized confirmation after a goal tap. {name} optional.
 GOAL_CONFIRM_TH = {
     "lose_weight":  "เยี่ยมเลย{name}! ตั้งเป้าหมายลดน้ำหนักให้แล้ว 🥑 ส่งรูปมื้อแรกมาได้เลย",
@@ -333,6 +343,7 @@ def build_journey_flex(display_name: str = "", current_goal: str | None = None, 
     ]
     choose = "เลือกเป้าหมายของคุณ" if th else "Choose your goal"
     labels = GOAL_BUTTON_LABEL if th else GOAL_BUTTON_LABEL_EN
+    names = GOAL_NAME_TH if th else GOAL_NAME_EN  # YOL-70: displayText echo
 
     body_contents = [
         {"type": "text", "text": greeting, "weight": "bold", "size": "xl", "color": "#16a34a"},
@@ -354,7 +365,8 @@ def build_journey_flex(display_name: str = "", current_goal: str | None = None, 
     # pre-selected. The selected goal is reflected in the header on re-open + the reply.
     buttons = [{
         "type": "button", "style": "secondary", "height": "sm", "margin": "sm",
-        "action": {"type": "postback", "label": labels[g], "data": f"action=set_goal&goal={g}"},
+        "action": {"type": "postback", "label": labels[g], "data": f"action=set_goal&goal={g}",
+                   "displayText": names[g]},  # YOL-70: instant echo of the tap
     } for g in ("lose_weight", "eat_clean", "build_muscle", "no_goal")]
 
     return {
@@ -995,8 +1007,17 @@ def handle_postback(event):
     action = data.get("action")
     if action == "set_goal" and data.get("goal") in GOAL_LABEL:
         lang = user.get("language", "th")
+        goal = data["goal"]
+        # YOL-70: idempotency — a rapid re-tap of the current goal re-confirms warmly,
+        # never reads as "changed → changed again". Check BEFORE _apply_goal mutates user.
+        if user.get("goal") == goal:
+            gname = (GOAL_NAME_TH if lang == "th" else GOAL_NAME_EN)[goal]
+            _reply(event.reply_token,
+                   f"เป้าหมายของคุณยังเป็น {gname} อยู่นะ 🌿" if lang == "th"
+                   else f"You're still set to {gname} 🌿")
+            return
         name = _display_name(line_user_id)
-        confirm = _apply_goal(user, line_user_id, data["goal"], lang)
+        confirm = _apply_goal(user, line_user_id, goal, lang)
         confirm = confirm.format(name=(f" {name}" if name else ""))
         _reply(event.reply_token, confirm)
     elif action == "open_goal_menu":  # YOL-64: Rich Menu button

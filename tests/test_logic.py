@@ -905,6 +905,40 @@ def test_onboarding_language():
     run("stored en → en", onboarding_lang("en") == "en")
 
 
+def test_goal_button_display_text():
+    print("=== Goal button displayText echo (YOL-70) ===")
+    # mirror: each goal button carries a non-empty displayText matching the card language
+    GOAL_NAME_TH = {"lose_weight": "ลดน้ำหนัก", "eat_clean": "กินคลีน",
+                    "build_muscle": "เพิ่มกล้ามเนื้อ", "no_goal": "ยังไม่มีเป้าหมาย"}
+    GOAL_NAME_EN = {"lose_weight": "Lose weight", "eat_clean": "Eat clean",
+                    "build_muscle": "Build muscle", "no_goal": "Just exploring"}
+
+    def buttons(th):
+        names = GOAL_NAME_TH if th else GOAL_NAME_EN
+        return [{"action": {"type": "postback", "data": f"action=set_goal&goal={g}",
+                            "displayText": names[g]}} for g in GOAL_NAME_TH]
+
+    th_btns = buttons(True)
+    run("every TH button has non-empty displayText",
+        all(b["action"].get("displayText") for b in th_btns))
+    run("TH displayText is plain name (no emoji)", th_btns[0]["action"]["displayText"] == "ลดน้ำหนัก")
+    run("data payload unchanged (stable enum)", th_btns[0]["action"]["data"] == "action=set_goal&goal=lose_weight")
+    en_btns = buttons(False)
+    run("EN displayText follows language", en_btns[1]["action"]["displayText"] == "Eat clean")
+
+
+def reconfirm_is_noop(current_goal, tapped_goal):
+    """Pure mirror of the YOL-70 idempotency check in handle_postback."""
+    return current_goal == tapped_goal
+
+
+def test_goal_retap_idempotency():
+    print("=== Goal re-tap idempotency (YOL-70) ===")
+    run("re-tap same goal → no-op re-confirm", reconfirm_is_noop("eat_clean", "eat_clean"))
+    run("tap different goal → real change", not reconfirm_is_noop("eat_clean", "lose_weight"))
+    run("new user default vs new goal → real change", not reconfirm_is_noop("no_goal", "build_muscle"))
+
+
 def test_postback_parsing():
     print("=== Postback parsing (YOL-63) ===")
     d = parse_postback("action=set_goal&goal=lose_weight")
@@ -1173,6 +1207,8 @@ if __name__ == "__main__":
         test_tracking_guard,
         test_month_stats,
         test_onboarding_language,
+        test_goal_button_display_text,
+        test_goal_retap_idempotency,
         test_postback_parsing,
         test_goal_menu_intent,
         test_checkin_pending,
