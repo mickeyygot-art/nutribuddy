@@ -905,6 +905,41 @@ def test_onboarding_language():
     run("stored en → en", onboarding_lang("en") == "en")
 
 
+def test_system_prompt_output_discipline():
+    print("=== System prompt output discipline (YOL-71) ===")
+    import os
+    main_path = os.path.join(os.path.dirname(__file__), "..", "main.py")
+    with open(main_path, encoding="utf-8") as f:
+        src = f.read()
+    run("no-refusal directive present", "NEVER add a refusal" in src)
+    run("no self-correction/meta directive present", "parenthetical self-corrections" in src)
+    run("uncommon-food directive present", "uncommon or unusual" in src)
+    run("off-topic-prefiltered note present", "filtered before they reach you" in src)
+
+
+def dish_language_rule(lang):
+    """Pure mirror of main.dish_language_rule (YOL-72)."""
+    if lang == "th":
+        return ("Write the DISH name in THAI, even for Western foods (e.g. โดนัทเคลือบน้ำตาลทอด, "
+                "ข้าวมันไก่ทอด, กะเพราหมูสับไข่ดาว). "
+                "Be specific about cooking method when visible (ทอด/ต้ม/ย่าง/ผัด).")
+    return ("Write the DISH name in ENGLISH (e.g. 'Glazed sugar donuts (deep-fried)', "
+            "'Fried chicken rice + boiled egg'). "
+            "Be specific about cooking method when visible (fried/steamed/grilled/stir-fried).")
+
+
+def test_dish_language_follows_user(text_is_thai=None):
+    print("=== Photo dish-name language follows user (YOL-72) ===")
+    th = dish_language_rule("th")
+    run("TH user → DISH in Thai", "THAI" in th)
+    run("TH rule names a Western food in Thai (donut)", "โดนัท" in th)
+    run("TH rule keeps cooking method", "ทอด" in th)
+    en = dish_language_rule("en")
+    run("EN user → DISH in English", "ENGLISH" in en)
+    run("EN rule example is English", "donut" in en.lower())
+    run("th and en rules differ", th != en)
+
+
 def test_goal_button_display_text():
     print("=== Goal button displayText echo (YOL-70) ===")
     # mirror: each goal button carries a non-empty displayText matching the card language
@@ -1207,6 +1242,8 @@ if __name__ == "__main__":
         test_tracking_guard,
         test_month_stats,
         test_onboarding_language,
+        test_system_prompt_output_discipline,
+        test_dish_language_follows_user,
         test_goal_button_display_text,
         test_goal_retap_idempotency,
         test_postback_parsing,

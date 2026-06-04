@@ -282,7 +282,13 @@ CONTENT:
 - Tone: quick text from a knowledgeable friend. Warm, never clinical.
 - Celebrate what is good first, then one small suggestion.
 - You know Thai/SEA food well: som tam, khao man gai, pad thai, tom yum, etc.
-- User's goal: {goal}"""
+- User's goal: {goal}
+
+OUTPUT DISCIPLINE — never break these (YOL-71):
+- Answer the food or cooking question directly. NEVER add a refusal, disclaimer, or any meta-commentary about whether you can or should answer.
+- NEVER narrate your own reasoning, NEVER write parenthetical self-corrections, and NEVER mention your own scope or rules inside a reply.
+- If a food is uncommon or unusual, just answer using general cooking/nutrition principles — do not comment on its rarity or appropriateness.
+- Off-topic messages are filtered before they reach you, so you never need to refuse — just answer."""
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
 
@@ -315,6 +321,18 @@ def is_goal_menu_request(text: str) -> bool:
     """YOL-64: True if the user wants to (re)open the goal card."""
     t = text.lower().strip()
     return any(kw in t for kw in GOAL_MENU_KEYWORDS)
+
+
+def dish_language_rule(lang: str) -> str:
+    """YOL-72: instruct the vision model to write the DISH name in the user's language,
+    so the logged name and dashboard match the chat language (for any food)."""
+    if lang == "th":
+        return ("Write the DISH name in THAI, even for Western foods (e.g. โดนัทเคลือบน้ำตาลทอด, "
+                "ข้าวมันไก่ทอด, กะเพราหมูสับไข่ดาว). "
+                "Be specific about cooking method when visible (ทอด/ต้ม/ย่าง/ผัด).")
+    return ("Write the DISH name in ENGLISH (e.g. 'Glazed sugar donuts (deep-fried)', "
+            "'Fried chicken rice + boiled egg'). "
+            "Be specific about cooking method when visible (fried/steamed/grilled/stir-fried).")
 
 
 def parse_postback(data: str) -> dict:
@@ -1357,11 +1375,12 @@ def handle_image(event):
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
     goal_label = GOAL_LABEL.get(user["goal"], "no specific goal")
 
-    # YOL-23: Updated vision prompt — extract full variant name including cooking method + sides
+    # YOL-23: full variant name incl. cooking method + sides.
+    # YOL-72: DISH line must be in the user's language so the logged name + dashboard
+    # match the chat language — for ANY food, Thai or Western.
     vision_prompt = (
         "What dish is this? Start your reply with 'DISH: [full dish name including cooking method and visible sides]' on the first line. "
-        "Examples: 'ข้าวมันไก่ทอด', 'ข้าวมันไก่ต้ม + ไข่ต้ม', 'กะเพราหมูสับไข่ดาว', 'Grilled salmon + steamed rice'. "
-        "Be specific about cooking method (ทอด/ต้ม/ย่าง/ผัด / fried/steamed/grilled/stir-fried) when visible. "
+        f"{dish_language_rule(lang)} "
         "Then a blank line, then your coaching response."
     )
 
